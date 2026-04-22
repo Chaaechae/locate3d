@@ -136,6 +136,9 @@ class Locate3DCriterion(nn.Module):
 
         indices = self.matcher(outputs, targets)
         losses = self._single_layer_loss(outputs, targets, indices, num_boxes)
+        # Expose the final-layer matching result for debug / visualization.
+        # Stored as a non-scalar key that the model forward pops before returning.
+        losses["_match_indices"] = indices
 
         if self.aux_loss and "aux_outputs" in outputs:
             for i, aux in enumerate(outputs["aux_outputs"]):
@@ -148,6 +151,8 @@ class Locate3DCriterion(nn.Module):
         # total weighted loss
         total = torch.zeros((), device=device)
         for k, v in losses.items():
+            if k.startswith("_"):
+                continue
             base = k.split("_aux_")[0]
             if base == "loss_class":
                 total = total + self.weight_class * v

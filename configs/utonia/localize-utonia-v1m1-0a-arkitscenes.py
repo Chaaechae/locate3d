@@ -213,6 +213,10 @@ hooks = [
     ),
     dict(type="IterationTimer", warmup_iter=2),
     dict(type="InformationWriter"),
+    # log query-collapse / matching diagnostics to stdout every 50 iters
+    dict(type="Locate3DDebugPrinter", print_every=50),
     dict(type="Locate3DGroundingEvaluator", iou_thresholds=(0.25, 0.5)),
+    # plotly HTML with RGB pointcloud + gt/pred boxes for 3 fixed val scenes
+    dict(type="Locate3DVizHook", num_scenes=3, top_k=5, viz_freq=1),
     dict(type="CheckpointSaver", save_freq=None),
 ]

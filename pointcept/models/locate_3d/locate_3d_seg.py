@@ -21,7 +21,7 @@ from pointcept.models.utils import offset2batch, offset2bincount
 from .locate_3d_decoder import Locate3DDecoder
 from .matcher import HungarianMatcher
 from .criterion import Locate3DCriterion
-from .bbox_utils import box_volume
+from .bbox_utils import box_volume, box_iou_3d
 
 
 def _pad_points(feats_list, coords_list):
@@ -177,9 +177,103 @@ class Locate3DLocalizer(nn.Module):
         if "positive_map" in input_dict:
             targets = self._build_targets(input_dict, sub_idx, coords_list)
             losses = self.criterion(out, targets)
-            result.update({k: v for k, v in losses.items()})
+            match_indices = losses.pop("_match_indices", None)
+
+            # Flatten: only scalar-tensor values go back to the trainer (the
+            # InformationWriter calls `.item()` on every key).
+            for k, v in losses.items():
+                if isinstance(v, torch.Tensor) and v.ndim == 0:
+                    result[k] = v
+
+            # ------- debug diagnostics (query-collapse / matching quality) -------
+            with torch.no_grad():
+                diag = self._debug_metrics(out, targets, match_indices, input_dict)
+            result.update(diag)
+
+            # stash matching + raw preds for hooks (not consumed by trainer logs)
+            self._last_match_indices = match_indices
+            self._last_outputs = out
+            self._last_targets = targets
         else:
             # inference only
             result["pred_masks"] = out["pred_masks"]
+            result["pred_logits"] = out["pred_logits"]
 
         return result
+
+    @staticmethod
+    def _pairwise_cosine(x):
+        x = F.normalize(x, dim=-1)
+        return x @ x.t()
+
+    def _debug_metrics(self, outputs, targets, indices, input_dict):
+        """Scalar diagnostics per batch. All returned as 0-dim tensors so the
+        Pointcept InformationWriter auto-logs them as train_batch/dbg_*."""
+        device = outputs["pred_logits"].device
+        pred_boxes = outputs["pred_boxes"]   # (B, Q, 6)
+        pred_logits = outputs["pred_logits"] # (B, Q, T)
+        B, Q, _ = pred_boxes.shape
+
+        # Predicted-box diversity (per-scene, then averaged).
+        centers = 0.5 * (pred_boxes[..., :3] + pred_boxes[..., 3:])  # (B, Q, 3)
+        sizes = (pred_boxes[..., 3:] - pred_boxes[..., :3]).clamp_min(0)
+        center_std = centers.std(dim=1).mean()     # avg across xyz & batch
+        size_std = sizes.std(dim=1).mean()
+
+        # Matched query usage + matching-quality.
+        all_matched_q = []
+        match_ious = []
+        match_iou_primary = []
+        gt_covered = 0
+        num_gt_total = 0
+        for b, (src, tgt) in enumerate(indices):
+            num_gt_total += int(targets[b]["boxes_xyzxyz"].shape[0])
+            if len(src) == 0:
+                continue
+            all_matched_q.append(src.to(device))
+            pbox = pred_boxes[b, src]                               # (G, 6)
+            gbox = targets[b]["boxes_xyzxyz"].to(device)[tgt]       # (G, 6)
+            iou = torch.diagonal(box_iou_3d(pbox, gbox)[0])          # (G,)
+            match_ious.append(iou)
+            gt_covered += int((iou > 0.25).sum().item())
+            primary = int(input_dict.get("primary_object_id", [0]*B)[b]
+                          if not isinstance(input_dict.get("primary_object_id", [0]*B)[b], torch.Tensor)
+                          else input_dict["primary_object_id"][b].flatten()[0].item())
+            # If the primary gt was matched, record its IoU.
+            tgt_cpu = tgt.cpu().tolist() if isinstance(tgt, torch.Tensor) else list(tgt)
+            if primary in tgt_cpu:
+                pos_in_matched = tgt_cpu.index(primary)
+                match_iou_primary.append(iou[pos_in_matched])
+
+        if len(all_matched_q) == 0:
+            match_iou = torch.zeros((), device=device)
+            query_entropy = torch.zeros((), device=device)
+            primary_iou = torch.zeros((), device=device)
+            unique_ratio = torch.zeros((), device=device)
+        else:
+            all_q = torch.cat(all_matched_q)            # (M,)
+            hist = torch.bincount(all_q, minlength=Q).float()
+            p = hist / hist.sum().clamp_min(1.0)
+            # entropy in nats; max = log(M) if all different queries
+            query_entropy = -(p[p > 0] * p[p > 0].log()).sum()
+            unique_ratio = (hist > 0).sum().float() / max(all_q.numel(), 1)
+            match_iou = torch.cat(match_ious).mean()
+            primary_iou = (
+                torch.stack(match_iou_primary).mean()
+                if len(match_iou_primary) > 0
+                else torch.zeros((), device=device)
+            )
+
+        coverage = torch.tensor(
+            gt_covered / max(num_gt_total, 1), device=device, dtype=torch.float32
+        )
+
+        return {
+            "dbg_match_iou": match_iou.detach().float(),
+            "dbg_match_iou_primary": primary_iou.detach().float(),
+            "dbg_gt_covered25": coverage.detach(),
+            "dbg_center_std": center_std.detach().float(),
+            "dbg_size_std": size_std.detach().float(),
+            "dbg_query_entropy": query_entropy.detach().float(),
+            "dbg_query_unique_ratio": unique_ratio.detach().float(),
+        }
