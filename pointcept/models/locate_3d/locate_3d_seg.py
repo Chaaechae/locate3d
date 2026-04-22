@@ -71,6 +71,7 @@ class Locate3DLocalizer(nn.Module):
         focal_gamma: float = 2.0,
         aux_loss: bool = True,
         max_points_train: int = 40000,
+        max_points_eval: int = 60000,
     ):
         super().__init__()
         self.backbone = build_model(backbone)
@@ -101,6 +102,7 @@ class Locate3DLocalizer(nn.Module):
             aux_loss=aux_loss,
         )
         self.max_points_train = max_points_train
+        self.max_points_eval = max_points_eval
 
     def _run_backbone(self, input_dict):
         point = Point(input_dict)
@@ -127,12 +129,17 @@ class Locate3DLocalizer(nn.Module):
         feats_list = _split_by_offset(feats, offset)
         coords_list = _split_by_offset(coords, offset)
 
-        # For training, optionally subsample to bound memory / compute
-        if self.training and self.max_points_train is not None:
+        # Cap per-scene point count in both training and eval.  The decoder's
+        # cross-attention is the memory bottleneck (8 layers with 256 queries
+        # attending to every point), so passing the raw ~200k-point ARKitScenes
+        # clouds straight through the decoder will OOM even on 80GB GPUs at
+        # eval time. ``max_points_{train,eval}`` = None disables the cap.
+        max_pts = self.max_points_train if self.training else self.max_points_eval
+        if max_pts is not None:
             sub_feats, sub_coords, sub_idx = [], [], []
             for f, c in zip(feats_list, coords_list):
-                if f.shape[0] > self.max_points_train:
-                    idx = torch.randperm(f.shape[0], device=f.device)[: self.max_points_train]
+                if f.shape[0] > max_pts:
+                    idx = torch.randperm(f.shape[0], device=f.device)[:max_pts]
                     sub_feats.append(f[idx])
                     sub_coords.append(c[idx])
                     sub_idx.append(idx)

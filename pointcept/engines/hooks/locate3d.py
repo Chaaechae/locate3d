@@ -258,6 +258,8 @@ class Locate3DVizHook(HookBase):
             )
             fig.write_html(out_path)
             self.trainer.logger.info(f"Locate3DVizHook: wrote {out_path}")
+            del out, gpu_batch, batch, pred_logits, pred_boxes
+            torch.cuda.empty_cache()
 
 
 @HOOKS.register_module()

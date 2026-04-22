@@ -113,20 +113,30 @@ class ARKitScenesLocate3DDataset(Dataset):
         # "42445211" in the annotation JSON).
         resolved = []
         dropped = []
+        missing_coord = []
+        # Only accept scene dirs that actually contain a coord.npy file.
+        # Cache per-dir validity to avoid hitting the FS repeatedly.
+        valid_dir_cache = {}
+
+        def _dir_has_coord(path):
+            if path in valid_dir_cache:
+                return valid_dir_cache[path]
+            ok = os.path.isfile(os.path.join(path, "coord.npy"))
+            valid_dir_cache[path] = ok
+            return ok
+
         for a in anns:
             sid = a["scene_id"]
-            if sid in self.scene_dirs:
-                a = dict(a)
-                a["_resolved_scene_dir"] = self.scene_dirs[sid]
-                resolved.append(a)
-                continue
-            match = self._fuzzy_resolve(sid)
-            if match is not None:
-                a = dict(a)
-                a["_resolved_scene_dir"] = match
-                resolved.append(a)
-            else:
+            match = self.scene_dirs.get(sid) or self._fuzzy_resolve(sid)
+            if match is None:
                 dropped.append(sid)
+                continue
+            if not _dir_has_coord(match):
+                missing_coord.append(sid)
+                continue
+            a = dict(a)
+            a["_resolved_scene_dir"] = match
+            resolved.append(a)
         self.anns = resolved
 
         logger = get_root_logger()
@@ -156,10 +166,15 @@ class ARKitScenesLocate3DDataset(Dataset):
                 )
             )
         logger.info(
-            "  -> kept {} / {} annotations ({} dropped).".format(
-                len(self.anns), len(anns), len(dropped)
+            "  -> kept {} / {} annotations "
+            "({} unresolved scene_id, {} missing coord.npy).".format(
+                len(self.anns), len(anns), len(dropped), len(missing_coord)
             )
         )
+        if len(missing_coord) > 0:
+            logger.warning(
+                "  missing coord.npy samples: {}".format(missing_coord[:5])
+            )
         if len(self.anns) == 0:
             raise RuntimeError(
                 "ARKitScenesLocate3DDataset: 0 annotations resolved. "
@@ -220,6 +235,12 @@ class ARKitScenesLocate3DDataset(Dataset):
             p = os.path.join(scene_dir, f"{asset}.npy")
             if os.path.exists(p):
                 out[asset] = np.load(p)
+        if "coord" not in out:
+            raise FileNotFoundError(
+                f"ARKitScenesLocate3DDataset: scene {ann.get('scene_id')} at "
+                f"{scene_dir} is missing coord.npy (contents: "
+                f"{sorted(os.listdir(scene_dir))[:10]})"
+            )
         return out
 
     def _build_positive_map(self, description, token_words, entities, object_ids):
@@ -267,8 +288,18 @@ class ARKitScenesLocate3DDataset(Dataset):
         ann = self.anns[idx % len(self.anns)]
         scene = self._load_scene(ann)
         coord = scene["coord"].astype(np.float32)
-        color = scene.get("color", np.zeros_like(coord)).astype(np.float32)
-        normal = scene.get("normal", np.zeros_like(coord)).astype(np.float32)
+        color = scene.get("color")
+        color = (
+            color.astype(np.float32)
+            if color is not None
+            else np.zeros_like(coord, dtype=np.float32)
+        )
+        normal = scene.get("normal")
+        normal = (
+            normal.astype(np.float32)
+            if normal is not None
+            else np.zeros_like(coord, dtype=np.float32)
+        )
 
         description = ann["description"]
         token_words = ann["token"]

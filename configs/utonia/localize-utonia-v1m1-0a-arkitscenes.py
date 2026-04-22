@@ -20,6 +20,7 @@ num_worker = 16
 mix_prob = 0.0
 clip_grad = 1.0
 empty_cache = False
+empty_cache_per_epoch = True  # release fragmented allocator memory between epochs
 enable_amp = True
 amp_dtype = "bfloat16"
 find_unused_parameters = True
@@ -104,6 +105,7 @@ model = dict(
     focal_gamma=2.0,
     aux_loss=True,
     max_points_train=40000,
+    max_points_eval=40000,  # hard cap to avoid decoder OOM on full val scenes
 )
 
 # scheduler settings

@@ -1000,6 +1000,12 @@ class Locate3DGroundingEvaluator(HookBase):
                     if iou >= t:
                         hits[t] += 1
 
+            # free per-batch tensors before loading the next (often much
+            # larger) scene, to avoid allocator fragmentation OOM after many
+            # variable-sized evaluations.
+            del output_dict, pred_logits, pred_boxes
+            torch.cuda.empty_cache()
+
         if comm.get_world_size() > 1:
             total_t = torch.tensor([total], dtype=torch.long, device="cuda")
             dist.all_reduce(total_t)
