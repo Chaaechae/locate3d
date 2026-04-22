@@ -24,6 +24,7 @@ enable_amp = True
 amp_dtype = "bfloat16"
 find_unused_parameters = True
 evaluate = True
+enable_wandb = False  # disable wandb, rely on train.log + JSONL/CSV
 
 # use a dedicated trainer that understands per-sample caption / box targets
 train = dict(type="Locate3DTrainer")
@@ -216,6 +217,8 @@ hooks = [
     # log query-collapse / matching diagnostics to stdout every 50 iters
     dict(type="Locate3DDebugPrinter", print_every=50),
     dict(type="Locate3DGroundingEvaluator", iou_thresholds=(0.25, 0.5)),
+    # persist every scalar into JSONL + CSV under save_path (no wandb needed)
+    dict(type="Locate3DMetricsLogger", log_train_every=1),
     # plotly HTML with RGB pointcloud + gt/pred boxes for 3 fixed val scenes
     dict(type="Locate3DVizHook", num_scenes=3, top_k=5, viz_freq=1),
     dict(type="CheckpointSaver", save_freq=None),

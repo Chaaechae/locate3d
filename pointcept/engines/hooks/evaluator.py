@@ -1029,6 +1029,11 @@ class Locate3DGroundingEvaluator(HookBase):
         key = f"Acc@{self.iou_thresholds[0]:g}"
         self.trainer.comm_info["current_metric_value"] = metrics[key]
         self.trainer.comm_info["current_metric_name"] = key
+        # Expose the full metrics dict (+ sample count) to non-wandb loggers.
+        self.trainer.comm_info["val_extras"] = {
+            **{f"val_{k}": float(v) for k, v in metrics.items()},
+            "val_num_samples": int(total),
+        }
 
     def after_train(self):
         self.trainer.logger.info(

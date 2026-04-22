@@ -261,6 +261,134 @@ class Locate3DVizHook(HookBase):
 
 
 @HOOKS.register_module()
+class Locate3DMetricsLogger(HookBase):
+    """Lightweight scalar metrics writer that does not depend on wandb.
+
+    Writes three files under ``cfg.save_path``:
+
+    - ``metrics_train_iter.jsonl`` : one JSON line per training iteration
+      containing ``{epoch, iter, global_iter, lr, **scalar_outputs}``.
+    - ``metrics_train_epoch.jsonl``: one line per epoch with the average of
+      each training scalar (pulled from Pointcept's ``storage``).
+    - ``metrics_val.jsonl``        : one line per evaluation epoch with the
+      primary metric (set via ``trainer.comm_info['current_metric_value']``)
+      plus optional extras pushed by the evaluator (``val_extras``).
+
+    Also writes parallel CSV files for easy pandas/spreadsheet import.
+    """
+
+    TRAIN_ITER = ("metrics_train_iter.jsonl", "metrics_train_iter.csv")
+    TRAIN_EPOCH = ("metrics_train_epoch.jsonl", "metrics_train_epoch.csv")
+    VAL = ("metrics_val.jsonl", "metrics_val.csv")
+
+    def __init__(self, log_train_every=1):
+        import json as _json
+        import csv as _csv
+        self._json = _json
+        self._csv = _csv
+        self.log_train_every = max(1, int(log_train_every))
+        self._global_iter = 0
+        self._train_keys = None          # CSV column order
+        self._epoch_keys = None
+        self._val_keys = None
+
+    def _path(self, pair):
+        return (
+            os.path.join(self.trainer.cfg.save_path, pair[0]),
+            os.path.join(self.trainer.cfg.save_path, pair[1]),
+        )
+
+    def _append_jsonl(self, path, record):
+        with open(path, "a") as f:
+            f.write(self._json.dumps(record, default=float) + "\n")
+
+    def _append_csv(self, path, record, keys_attr):
+        keys = getattr(self, keys_attr)
+        write_header = keys is None or not os.path.exists(path)
+        if keys is None:
+            keys = list(record.keys())
+            setattr(self, keys_attr, keys)
+        with open(path, "a", newline="") as f:
+            w = self._csv.writer(f)
+            if write_header:
+                w.writerow(keys)
+            w.writerow([record.get(k, "") for k in keys])
+
+    # ---------- hook entry points ----------
+    def before_train(self):
+        if not comm.is_main_process():
+            return
+        os.makedirs(self.trainer.cfg.save_path, exist_ok=True)
+        self._global_iter = self.trainer.start_epoch * len(self.trainer.train_loader)
+
+    def after_step(self):
+        self._global_iter += 1
+        if not comm.is_main_process():
+            return
+        if self._global_iter % self.log_train_every != 0:
+            return
+        out = self.trainer.comm_info.get("model_output_dict", None)
+        if out is None:
+            return
+        rec = {
+            "epoch": self.trainer.epoch + 1,
+            "iter": int(self.trainer.comm_info.get("iter", -1)) + 1,
+            "global_iter": self._global_iter,
+            "lr": float(
+                self.trainer.optimizer.state_dict()["param_groups"][0]["lr"]
+            ),
+        }
+        for k, v in out.items():
+            if isinstance(v, torch.Tensor) and v.ndim == 0:
+                rec[k] = float(v.item())
+        j_path, c_path = self._path(self.TRAIN_ITER)
+        self._append_jsonl(j_path, rec)
+        self._append_csv(c_path, rec, "_train_keys")
+
+    def after_epoch(self):
+        if not comm.is_main_process():
+            return
+        epoch = self.trainer.epoch + 1
+
+        # training scalars averaged over the epoch
+        train_rec = {"epoch": epoch}
+        storage = getattr(self.trainer, "storage", None)
+        if storage is not None:
+            histories = storage.histories()
+            for key, hist in histories.items():
+                try:
+                    train_rec[key] = float(hist.avg)
+                except Exception:
+                    continue
+        if len(train_rec) > 1:
+            j_path, c_path = self._path(self.TRAIN_EPOCH)
+            self._append_jsonl(j_path, train_rec)
+            self._append_csv(c_path, train_rec, "_epoch_keys")
+
+        # val metric (set by evaluator)
+        if self.trainer.cfg.evaluate:
+            current_metric_value = self.trainer.comm_info.get(
+                "current_metric_value", None
+            )
+            current_metric_name = self.trainer.comm_info.get(
+                "current_metric_name", "metric"
+            )
+            if current_metric_value is not None:
+                val_rec = {
+                    "epoch": epoch,
+                    current_metric_name: float(current_metric_value),
+                }
+                for k, v in self.trainer.comm_info.get("val_extras", {}).items():
+                    try:
+                        val_rec[k] = float(v)
+                    except Exception:
+                        pass
+                j_path, c_path = self._path(self.VAL)
+                self._append_jsonl(j_path, val_rec)
+                self._append_csv(c_path, val_rec, "_val_keys")
+
+
+@HOOKS.register_module()
 class Locate3DDebugPrinter(HookBase):
     """Lightweight logger: prints the debug scalars reported by the model every
     ``print_every`` train iterations so ``dbg_match_iou`` / ``dbg_query_entropy``

@@ -102,9 +102,17 @@ def _distributed_worker(
         torch.cuda.is_available()
     ), "cuda is not available. Please check your installation."
     global_rank = machine_rank * num_gpus_per_machine + local_rank
+    # Backend selection: environment variable ``DIST_BACKEND`` can be set to
+    # ``gloo`` to work around broken NCCL installations. Defaults to NCCL
+    # for backward compatibility.
+    backend = os.environ.get("DIST_BACKEND", "nccl").lower()
+    if backend not in ("nccl", "gloo"):
+        raise ValueError(
+            f"Unsupported DIST_BACKEND={backend!r}; must be 'nccl' or 'gloo'."
+        )
     try:
         dist.init_process_group(
-            backend="NCCL",
+            backend=backend,
             init_method=dist_url,
             world_size=world_size,
             rank=global_rank,
@@ -112,7 +120,9 @@ def _distributed_worker(
         )
     except Exception as e:
         logger = logging.getLogger(__name__)
-        logger.error("Process group URL: {}".format(dist_url))
+        logger.error(
+            "Process group URL: {} backend: {}".format(dist_url, backend)
+        )
         raise e
 
     # Setup the local process group (which contains ranks within the same machine)
