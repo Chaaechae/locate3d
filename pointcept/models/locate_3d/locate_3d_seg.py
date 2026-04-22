@@ -172,15 +172,22 @@ class Locate3DLocalizer(nn.Module):
 
         out = self.decoder(feats, coords, pad_mask, captions)
 
-        result = {"pred_logits": out["pred_logits"], "pred_boxes": out["pred_boxes"]}
+        # During training, the Pointcept InformationWriter calls `.item()` on
+        # every value in the returned dict, so only scalar tensors may be
+        # returned. Non-scalar prediction tensors (pred_logits / pred_boxes /
+        # pred_masks) are only needed by eval / viz hooks, so we include them
+        # only when not training.
+        result = {}
+        if not self.training:
+            result["pred_logits"] = out["pred_logits"]
+            result["pred_boxes"] = out["pred_boxes"]
+            result["pred_masks"] = out["pred_masks"]
 
         if "positive_map" in input_dict:
             targets = self._build_targets(input_dict, sub_idx, coords_list)
             losses = self.criterion(out, targets)
             match_indices = losses.pop("_match_indices", None)
 
-            # Flatten: only scalar-tensor values go back to the trainer (the
-            # InformationWriter calls `.item()` on every key).
             for k, v in losses.items():
                 if isinstance(v, torch.Tensor) and v.ndim == 0:
                     result[k] = v
@@ -189,15 +196,6 @@ class Locate3DLocalizer(nn.Module):
             with torch.no_grad():
                 diag = self._debug_metrics(out, targets, match_indices, input_dict)
             result.update(diag)
-
-            # stash matching + raw preds for hooks (not consumed by trainer logs)
-            self._last_match_indices = match_indices
-            self._last_outputs = out
-            self._last_targets = targets
-        else:
-            # inference only
-            result["pred_masks"] = out["pred_masks"]
-            result["pred_logits"] = out["pred_logits"]
 
         return result
 

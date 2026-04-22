@@ -29,7 +29,7 @@ evaluate = True
 train = dict(type="Locate3DTrainer")
 
 # dataset paths
-arkit_root = "/group-volume/arkitscenes-preprocessed"
+arkit_root = "/group-volume/arkitscenes-compressed"
 train_annotation = "locate-3d/locate3d_data/train_arkitscenes.json"
 val_annotation = "locate-3d/locate3d_data/val_arkitscenes.json"
 

@@ -108,23 +108,103 @@ class ARKitScenesLocate3DDataset(Dataset):
 
         self.scene_dirs = self._index_scenes()
 
-        # Drop annotations for scenes we don't have on disk.
-        self.anns = [a for a in anns if a["scene_id"] in self.scene_dirs]
+        # Flexible scene-id resolution: fall back to prefix / suffix /
+        # stripped-prefix matching (e.g. "arkit_42445211" on disk vs.
+        # "42445211" in the annotation JSON).
+        resolved = []
+        dropped = []
+        for a in anns:
+            sid = a["scene_id"]
+            if sid in self.scene_dirs:
+                a = dict(a)
+                a["_resolved_scene_dir"] = self.scene_dirs[sid]
+                resolved.append(a)
+                continue
+            match = self._fuzzy_resolve(sid)
+            if match is not None:
+                a = dict(a)
+                a["_resolved_scene_dir"] = match
+                resolved.append(a)
+            else:
+                dropped.append(sid)
+        self.anns = resolved
 
         logger = get_root_logger()
         logger.info(
-            "Locate3D ARKitScenes: {} annotations on {} scenes (dropped {}).".format(
-                len(self.anns), len(self.scene_dirs), len(anns) - len(self.anns)
+            "Locate3D ARKitScenes: data_root={} splits={} -> indexed {} scene dirs.".format(
+                self.data_root, list(self.split), len(self.scene_dirs)
             )
         )
+        if len(self.scene_dirs) == 0:
+            sample_globs = sorted(
+                os.listdir(self.data_root)
+                if os.path.isdir(self.data_root)
+                else []
+            )[:5]
+            logger.warning(
+                "  No scene directories found under {} / {{{}}}. "
+                "data_root contents (first 5): {}".format(
+                    self.data_root, ",".join(self.split), sample_globs
+                )
+            )
+        if len(anns) > 0:
+            sample_scene_ids = [a["scene_id"] for a in anns[:5]]
+            sample_on_disk = list(self.scene_dirs.keys())[:5]
+            logger.info(
+                "  annotation scene_id samples: {} ; on-disk samples: {}".format(
+                    sample_scene_ids, sample_on_disk
+                )
+            )
+        logger.info(
+            "  -> kept {} / {} annotations ({} dropped).".format(
+                len(self.anns), len(anns), len(dropped)
+            )
+        )
+        if len(self.anns) == 0:
+            raise RuntimeError(
+                "ARKitScenesLocate3DDataset: 0 annotations resolved. "
+                "Check `data_root` (={!r}) and `split` (={!r}). "
+                "Each scene must be located at "
+                "data_root/<split>/<scene_id>/{{coord,color,normal}}.npy.".format(
+                    self.data_root, self.split
+                )
+            )
 
     def _index_scenes(self):
         scene_dirs = {}
         for split in self.split:
-            for p in glob.glob(os.path.join(self.data_root, split, "*")):
-                if os.path.isdir(p):
-                    scene_dirs[os.path.basename(p)] = p
+            split_root = os.path.join(self.data_root, split)
+            if not os.path.isdir(split_root):
+                continue
+            for name in os.listdir(split_root):
+                full = os.path.join(split_root, name)
+                if os.path.isdir(full):
+                    scene_dirs[name] = full
         return scene_dirs
+
+    def _fuzzy_resolve(self, scene_id):
+        """Try to find a matching dir by trailing-id match or prefix strip.
+        Returns the resolved dir path or None."""
+        if not hasattr(self, "_fuzzy_cache"):
+            # precompute {digits-only-part: dir} and {name.endswith(scene_id): dir}
+            by_suffix = {}
+            by_digits = {}
+            for name, p in self.scene_dirs.items():
+                digits = "".join(ch for ch in name if ch.isdigit())
+                by_digits.setdefault(digits, p)
+                by_suffix.setdefault(name, p)
+            self._fuzzy_cache = (by_suffix, by_digits)
+
+        by_suffix, by_digits = self._fuzzy_cache
+        digits = "".join(ch for ch in scene_id if ch.isdigit())
+        # exact digits match
+        if digits in by_digits:
+            return by_digits[digits]
+        # endswith match
+        for name, p in by_suffix.items():
+            if name.endswith(scene_id) or scene_id.endswith(name):
+                return p
+        return None
 
     def __len__(self):
         return len(self.anns) * self.loop
@@ -133,8 +213,8 @@ class ARKitScenesLocate3DDataset(Dataset):
         ann = self.anns[idx % len(self.anns)]
         return f"{ann['scene_id']}_{ann.get('primary_key', ann.get('ann_id', idx))}"
 
-    def _load_scene(self, scene_id):
-        scene_dir = self.scene_dirs[scene_id]
+    def _load_scene(self, ann):
+        scene_dir = ann.get("_resolved_scene_dir") or self.scene_dirs[ann["scene_id"]]
         out = {}
         for asset in self.PC_VALID_ASSETS:
             p = os.path.join(scene_dir, f"{asset}.npy")
@@ -185,7 +265,7 @@ class ARKitScenesLocate3DDataset(Dataset):
 
     def get_data(self, idx):
         ann = self.anns[idx % len(self.anns)]
-        scene = self._load_scene(ann["scene_id"])
+        scene = self._load_scene(ann)
         coord = scene["coord"].astype(np.float32)
         color = scene.get("color", np.zeros_like(coord)).astype(np.float32)
         normal = scene.get("normal", np.zeros_like(coord)).astype(np.float32)

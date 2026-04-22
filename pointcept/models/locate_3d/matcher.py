@@ -38,14 +38,16 @@ class HungarianMatcher(nn.Module):
         Returns list of (pred_idx, gt_idx) per sample.
         """
         B, Q, T = outputs["pred_logits"].shape
-        out_prob = outputs["pred_logits"].sigmoid()  # (B, Q, T)
-        out_bbox = outputs["pred_boxes"]              # (B, Q, 6)
+        # cast to float32 so cost computation (cdist / giou) is numerically
+        # stable and compatible with float32 ground-truth tensors under AMP.
+        out_prob = outputs["pred_logits"].float().sigmoid()  # (B, Q, T)
+        out_bbox = outputs["pred_boxes"].float()              # (B, Q, 6)
 
         indices = []
         for b in range(B):
             tgt = targets[b]
-            pos_map = tgt["positive_map"].to(out_prob.device)  # (G, T)
-            tgt_bbox = tgt["boxes_xyzxyz"].to(out_bbox.device)  # (G, 6)
+            pos_map = tgt["positive_map"].to(device=out_prob.device, dtype=out_prob.dtype)
+            tgt_bbox = tgt["boxes_xyzxyz"].to(device=out_bbox.device, dtype=out_bbox.dtype)
             G = pos_map.shape[0]
             if G == 0:
                 indices.append(

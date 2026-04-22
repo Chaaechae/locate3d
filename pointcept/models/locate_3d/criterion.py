@@ -64,39 +64,44 @@ class Locate3DCriterion(nn.Module):
 
     def _single_layer_loss(self, outputs, targets, indices, num_boxes):
         losses = {}
-        B, Q, T = outputs["pred_logits"].shape
         device = outputs["pred_logits"].device
 
+        # Compute losses in float32 for numerical stability under AMP/bf16.
+        pred_logits = outputs["pred_logits"].float()       # (B, Q, T)
+        pred_boxes = outputs["pred_boxes"].float()         # (B, Q, 6)
+        text_attn_mask = outputs["text_attn_mask"]         # (B, T) True = pad
+
         # --- text alignment ---
-        pred_logits = outputs["pred_logits"]  # (B, Q, T)
-        text_attn_mask = outputs["text_attn_mask"]  # (B, T) True where pad
-        tgt_map = torch.zeros_like(pred_logits)
+        tgt_map = torch.zeros_like(pred_logits)            # float32
         for b, (src, tgt) in enumerate(indices):
             if len(src) == 0:
                 continue
-            pos_map = targets[b]["positive_map"].to(device)  # (G, T)
+            pos_map = targets[b]["positive_map"].to(
+                device=device, dtype=tgt_map.dtype
+            )
             tgt_map[b, src] = pos_map[tgt]
 
         valid = (~text_attn_mask).unsqueeze(1).expand_as(pred_logits)
-        pred_logits = pred_logits.masked_select(valid)
-        tgt_map = tgt_map.masked_select(valid)
+        flat_logits = pred_logits.masked_select(valid)
+        flat_tgt = tgt_map.masked_select(valid)
         losses["loss_class"] = sigmoid_focal_loss(
-            pred_logits.unsqueeze(0),
-            tgt_map.unsqueeze(0),
+            flat_logits.unsqueeze(0),
+            flat_tgt.unsqueeze(0),
             num_boxes,
             alpha=self.focal_alpha,
             gamma=self.focal_gamma,
         )
 
         # --- bbox ---
-        pred_boxes = outputs["pred_boxes"]
         src_boxes = []
         tgt_boxes = []
         for b, (src, tgt) in enumerate(indices):
             if len(src) == 0:
                 continue
             src_boxes.append(pred_boxes[b, src])
-            tgt_boxes.append(targets[b]["boxes_xyzxyz"].to(device)[tgt])
+            tgt_boxes.append(
+                targets[b]["boxes_xyzxyz"].to(device=device, dtype=pred_boxes.dtype)[tgt]
+            )
         if len(src_boxes) > 0:
             src_boxes = torch.cat(src_boxes, dim=0)
             tgt_boxes = torch.cat(tgt_boxes, dim=0)
@@ -109,19 +114,21 @@ class Locate3DCriterion(nn.Module):
         losses["loss_bbox"] = loss_bbox
         losses["loss_giou"] = loss_giou
 
-        # --- masks (optional: requires targets[b]['masks']) ---
+        # --- masks (optional) ---
         if "pred_masks" in outputs and any("masks" in t for t in targets):
-            pred_masks = outputs["pred_masks"]  # (B, Q, N)
+            pred_masks = outputs["pred_masks"].float()  # (B, Q, N)
             src_masks = []
             tgt_masks = []
             for b, (src, tgt) in enumerate(indices):
                 if len(src) == 0 or "masks" not in targets[b]:
                     continue
-                src_masks.append(pred_masks[b, src])                   # (G, N)
-                tgt_masks.append(targets[b]["masks"].to(device)[tgt])  # (G, N)
+                src_masks.append(pred_masks[b, src])
+                tgt_masks.append(
+                    targets[b]["masks"].to(device=device, dtype=pred_masks.dtype)[tgt]
+                )
             if len(src_masks) > 0:
                 src_masks = torch.cat(src_masks, dim=0)
-                tgt_masks = torch.cat(tgt_masks, dim=0).float()
+                tgt_masks = torch.cat(tgt_masks, dim=0)
                 losses["loss_mask_bce"] = F.binary_cross_entropy_with_logits(
                     src_masks, tgt_masks, reduction="none"
                 ).mean(1).sum() / max(num_boxes, 1)
