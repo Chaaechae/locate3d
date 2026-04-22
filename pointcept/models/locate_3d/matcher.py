@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
-from .bbox_utils import generalized_box_iou_3d
+from .bbox_utils import generalized_box_iou_3d, box_xyzxyz_to_cxcyczwhd
 
 
 class HungarianMatcher(nn.Module):
@@ -58,21 +58,23 @@ class HungarianMatcher(nn.Module):
                 )
                 continue
 
-            # Classification cost (soft token).
-            #   pos_tokens contribute  -log(p) cost
-            #   neg_tokens contribute  -log(1-p) cost
+            # Classification cost (MDETR soft-token).
+            # ``-prob @ pos_map.T`` gives each (query, gt) pair the negative
+            # probability mass the query puts on the gt's positive tokens.
+            # Unlike ``-log(prob)`` this is bounded and varies meaningfully
+            # across queries even at initialization (when sigmoid(logits) is
+            # close to 0.5 for all queries), so the Hungarian solver is not
+            # forced to rely on the bbox / GIoU costs alone.
             prob = out_prob[b]  # (Q, T)
-            token_cnt = pos_map.sum(-1).clamp_min(1.0)  # (G,)
-            pos_cost = -(prob.clamp_min(1e-8).log())  # (Q, T)
-            neg_cost = -((1 - prob).clamp_min(1e-8).log())  # (Q, T)
-            # cost[q,g] = mean over positive tokens of pos_cost[q,t]
-            #          + mean over (all) tokens of neg_cost[q,t] w.r.t. 1-pos_map[g,t]
-            cost_class = (pos_cost @ pos_map.t()) / token_cnt.unsqueeze(0)
-            # Simple class cost: focus on positive tokens only (MDETR-style soft token).
+            cost_class = -(prob @ pos_map.t())  # (Q, G)
 
-            # Bbox L1 cost on center+size representation for scale-invariance.
+            # Bbox L1 cost on center+size (cxcyczwhd) so translation and
+            # extent errors are on the same scale regardless of absolute
+            # world-coordinate magnitude.
             pred = out_bbox[b]
-            cost_bbox = torch.cdist(pred, tgt_bbox, p=1)
+            pred_csz = box_xyzxyz_to_cxcyczwhd(pred)
+            tgt_csz = box_xyzxyz_to_cxcyczwhd(tgt_bbox)
+            cost_bbox = torch.cdist(pred_csz, tgt_csz, p=1)
 
             # GIoU cost
             giou = generalized_box_iou_3d(pred, tgt_bbox)

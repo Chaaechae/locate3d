@@ -314,6 +314,17 @@ class ARKitScenesLocate3DDataset(Dataset):
             description, token_words, entities, object_ids
         )  # (G, T)
 
+        # Center points and GT boxes jointly around the scene centroid so the
+        # decoder regresses boxes in a near-zero frame. ARKitScenes raw coords
+        # live in world meters with arbitrary per-scene offsets, which makes
+        # the bbox-head regression hard to fit from random init. Subtracting
+        # the same centroid from coord and boxes_xyzxyz keeps the two in the
+        # same frame so IoU (evaluator/viz) stays correct.
+        centroid = coord.mean(axis=0).astype(np.float32)  # (3,)
+        coord = coord - centroid
+        shift6 = np.concatenate([centroid, centroid], axis=0)
+        boxes_xyzxyz = boxes_xyzxyz.astype(np.float32) - shift6
+
         return dict(
             coord=coord,
             color=color,

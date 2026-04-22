@@ -20,7 +20,16 @@ def sigmoid_focal_loss(
     num_boxes: float,
     alpha: float = 0.25,
     gamma: float = 2.0,
+    token_mask: torch.Tensor = None,
 ):
+    """MDETR-style focal loss on text-token alignment logits.
+
+    ``inputs`` / ``targets`` are (B, Q, T); token_mask is (B, T) with 1 on
+    valid (non-padded) tokens. The reduction averages over the token dim
+    (so we do not shrink the signal as sentence length grows), sums over
+    queries, and divides by ``num_boxes`` (matched pairs in the batch) as
+    in the original DETR / MDETR recipe.
+    """
     prob = inputs.sigmoid()
     ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
     p_t = prob * targets + (1 - prob) * (1 - targets)
@@ -28,7 +37,14 @@ def sigmoid_focal_loss(
     if alpha >= 0:
         alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
         loss = alpha_t * loss
-    return loss.mean(1).sum() / max(num_boxes, 1)
+    if token_mask is not None:
+        mask = token_mask.unsqueeze(1).to(loss.dtype)  # (B, 1, T)
+        loss = loss * mask
+        denom = mask.sum(-1).clamp_min(1.0)            # (B, 1)
+        loss = loss.sum(-1) / denom                    # (B, Q)
+    else:
+        loss = loss.mean(-1)                            # (B, Q)
+    return loss.sum() / max(num_boxes, 1)
 
 
 def dice_loss(pred, target, num_boxes, eps: float = 1e-6):
@@ -81,15 +97,14 @@ class Locate3DCriterion(nn.Module):
             )
             tgt_map[b, src] = pos_map[tgt]
 
-        valid = (~text_attn_mask).unsqueeze(1).expand_as(pred_logits)
-        flat_logits = pred_logits.masked_select(valid)
-        flat_tgt = tgt_map.masked_select(valid)
+        token_mask = (~text_attn_mask).to(pred_logits.dtype)  # (B, T)
         losses["loss_class"] = sigmoid_focal_loss(
-            flat_logits.unsqueeze(0),
-            flat_tgt.unsqueeze(0),
+            pred_logits,
+            tgt_map,
             num_boxes,
             alpha=self.focal_alpha,
             gamma=self.focal_gamma,
+            token_mask=token_mask,
         )
 
         # --- bbox ---

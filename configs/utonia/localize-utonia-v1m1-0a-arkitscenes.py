@@ -41,7 +41,7 @@ utonia_pretrained_path = None
 # decoder configuration
 decoder_cfg = dict(
     d_model=768,
-    num_queries=256,
+    num_queries=64,
     num_decoder_layers=8,
     transformer_n_heads=12,
     transformer_dim_feedforward=3072,
@@ -93,10 +93,10 @@ model = dict(
         rescale_coords=1.2,
     ),
     decoder=decoder_cfg,
-    matcher_cost_class=1.0,
+    matcher_cost_class=2.0,
     matcher_cost_bbox=5.0,
     matcher_cost_giou=2.0,
-    loss_weight_class=1.0,
+    loss_weight_class=2.0,
     loss_weight_bbox=5.0,
     loss_weight_giou=2.0,
     loss_weight_mask_bce=0.0,
