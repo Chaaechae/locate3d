@@ -37,7 +37,15 @@ _base_ = ["../_base_/default_runtime.py"]
 batch_size = 16  # total bs across all gpus
 num_worker = 16
 mix_prob = 0.0
-clip_grad = 1.0
+# clip_grad is intentionally loose. Locate-3D's decoder shares one BBoxHead
+# across all 9 supervised layers (final + 8 aux), so the gradient summed at
+# the head's parameters accumulates 9x for every batch -- combined with
+# loss_weight_bbox=5 + loss_weight_giou=3 in raw meters, the global grad
+# norm sits in the hundreds at init. clip_grad=1.0 was scaling the
+# bbox-head update down ~100-1000x and the head's offset weights essentially
+# could not move (loss_bbox stalled at ~3, dbg_match_iou ~0.015). 10.0
+# leaves the head room to learn while still catching genuine spikes.
+clip_grad = 10.0
 empty_cache = False
 empty_cache_per_epoch = True
 enable_amp = True
