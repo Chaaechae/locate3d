@@ -344,6 +344,25 @@ class _BaseScanNetFamilyLocate3DDataset(Dataset):
 
         data_dict["point_masks"] = masks
         data_dict["boxes_xyzxyz"] = boxes.float()
+        # IMPORTANT: drop ``instance`` before the collate sees it.
+        #
+        # Reason: in combined-corpus training (0h), a single batch can
+        # mix ARKit and ScanNet / ScanNet++ samples via ConcatDataset.
+        # The ARKit adapter does NOT emit ``instance``; the ScanNet
+        # family does. The Locate-3D collate (locate3d_collate.py) treats
+        # ``instance`` as a point-tensor key and concatenates only the
+        # samples that carry it. If a mixed batch contains both kinds,
+        # ``out["instance"]`` ends up length = sum(scannet points) while
+        # ``out["coord"]`` is length = sum(all points); downstream code
+        # that assumes per-point tensors share length then hits a
+        # ``size of tensor a must match size of tensor b`` error (most
+        # visibly, it surfaces as a broadcast failure deep inside the
+        # backbone's Point construction or serialization).
+        #
+        # We only needed ``instance`` to derive ``point_masks`` above;
+        # once that's done, dropping it makes ScanNet samples shape-
+        # compatible with ARKit samples for the rest of the pipeline.
+        data_dict.pop("instance", None)
         return data_dict
 
 

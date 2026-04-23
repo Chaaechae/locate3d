@@ -59,9 +59,15 @@ def locate3d_collate_fn(batch):
     point_offsets = []  # cumulative number of points per sample
     running = 0
 
-    # Determine per-sample point count from whichever point-key we find first.
+    # Determine per-sample point count. Use an EXPLICIT priority list
+    # instead of iterating ``_POINT_TENSOR_KEYS`` (which is a set --
+    # Python does not guarantee set iteration order across runs or
+    # interpreter builds). Without this, mixed batches (e.g. combining
+    # ARKit and ScanNet via ConcatDataset) could compute the batch-wide
+    # offset from "normal" on one run and "coord" on another.
+    _count_priority = ("coord", "grid_coord", "feat", "color", "normal")
     point_count_key = None
-    for k in _POINT_TENSOR_KEYS:
+    for k in _count_priority:
         if k in batch[0]:
             point_count_key = k
             break
