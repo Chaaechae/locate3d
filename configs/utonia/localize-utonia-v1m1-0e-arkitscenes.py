@@ -218,6 +218,7 @@ hooks = [
         keywords="module.student.backbone",
         replacement="module.backbone",
     ),
+    dict(type="Locate3DStartupSanity"),
     dict(type="IterationTimer", warmup_iter=2),
     dict(type="InformationWriter"),
     dict(type="Locate3DDebugPrinter", print_every=50),

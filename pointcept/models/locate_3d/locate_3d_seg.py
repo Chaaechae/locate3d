@@ -59,6 +59,18 @@ class Locate3DLocalizer(nn.Module):
         backbone_out_channels: int,
         decoder_input_feat_dim: int = 256,
         freeze_backbone: bool = False,
+        # 0 = use backbone's returned point. With enc_mode=True that is the
+        # bottleneck (stride 16, ``enc_channels[-1]``). Larger values step
+        # ``level`` times up the GridPooling ``pooling_parent`` chain, giving
+        # finer-resolution features from earlier encoder stages. Only
+        # meaningful when ``enc_mode=True`` (otherwise the decoder stack has
+        # already consumed the chain). Example: level=1 returns stage (N-1),
+        # which for our PT-v3m3 is 432 channels at stride 8 -- this is also
+        # the level Utonia's 2D-3D DINOv2 alignment was applied at
+        # (``enc2d_upcast_level=3``), so its features have stronger semantic
+        # content than the bottleneck (which is tuned for masked-patch
+        # reconstruction).
+        backbone_feature_level: int = 0,
         matcher_cost_class: float = 1.0,
         matcher_cost_bbox: float = 5.0,
         matcher_cost_giou: float = 2.0,
@@ -80,6 +92,7 @@ class Locate3DLocalizer(nn.Module):
         if self.freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad = False
+        self.backbone_feature_level = int(backbone_feature_level)
 
         # project encoder feats to the decoder input dimension
         self.feat_proj = nn.Linear(backbone_out_channels, decoder_input_feat_dim)
@@ -113,24 +126,29 @@ class Locate3DLocalizer(nn.Module):
                 point = self.backbone(point)
         else:
             point = self.backbone(point)
-        # Discard the pooling chain recorded by GridPooling(traceable=True).
-        # Two cases:
-        #   - enc_mode=False: the U-Net ``dec`` stack already walked and consumed the
-        #     chain via GridUnpooling, so this loop is a no-op.
-        #   - enc_mode=True: ``dec`` was skipped, so the pooling_parent chain is still
-        #     attached to the bottleneck point. We must NOT try to reconstruct a
-        #     full-resolution feature by channel-concat -- that would produce
-        #     ~1386-d features (sum of enc_channels) from random-init paths since
-        #     no decoder weights were used, and break the
-        #     ``feat_proj=Linear(backbone_out_channels, 256)`` head downstream.
-        # In both cases we just drop references so Python can free the up-stream
-        # per-level Point objects instead of keeping the full pyramid in memory.
-        if isinstance(point, Point):
-            while "pooling_parent" in point.keys():
-                point.pop("pooling_parent")
-                point.pop("pooling_inverse")
-                if "idx_ptr" in point.keys():
-                    point.pop("idx_ptr")
+        if not isinstance(point, Point):
+            return point
+
+        # Optionally step up the GridPooling chain to a finer-resolution
+        # encoder stage. Only possible when the backbone ran in enc_mode=True
+        # (otherwise the decoder stack already consumed the chain).
+        for _ in range(self.backbone_feature_level):
+            if "pooling_parent" not in point.keys():
+                break
+            parent = point.pop("pooling_parent")
+            point.pop("pooling_inverse", None)
+            if "idx_ptr" in point.keys():
+                point.pop("idx_ptr")
+            point = parent
+
+        # Drop the rest of the chain so Python can free the upstream per-level
+        # Point objects instead of keeping the full pyramid in memory. Also
+        # avoids re-entering this logic on a downstream recursive forward.
+        while "pooling_parent" in point.keys():
+            point.pop("pooling_parent")
+            point.pop("pooling_inverse")
+            if "idx_ptr" in point.keys():
+                point.pop("idx_ptr")
         return point
 
     def _encode(self, input_dict):
@@ -260,6 +278,8 @@ class Locate3DLocalizer(nn.Module):
         samples_all_covered = 0           # per-sample: every GT in matched pair > 0.25
         topk_recall_hits = 0              # per-sample: top-K by text score covers every GT
         num_nonempty_samples = 0
+        center_dists = []                 # L2 distance from matched query center to GT center
+        size_errs = []                    # L1 size error between matched query and GT (sum over 3 dims)
         for b, (src, tgt) in enumerate(indices):
             n_gt_b = int(targets[b]["boxes_xyzxyz"].shape[0])
             num_gt_total += n_gt_b
@@ -278,6 +298,19 @@ class Locate3DLocalizer(nn.Module):
                 gt_covered += int((iou > 0.25).sum().item())
                 if len(src) == n_gt_b and bool((iou > 0.25).all()):
                     samples_all_covered += 1
+                # IoU-independent diagnostics: center L2 and size-L1 error.
+                # Even when IoU is 0 (boxes don't overlap), these show whether
+                # the regression is moving in the right direction.
+                p_center = 0.5 * (pbox[:, :3] + pbox[:, 3:])
+                g_center = 0.5 * (gbox_matched[:, :3] + gbox_matched[:, 3:])
+                center_dists.append(
+                    torch.linalg.norm(p_center - g_center, dim=-1)            # (G,)
+                )
+                p_size = (pbox[:, 3:] - pbox[:, :3]).clamp_min(0.0)
+                g_size = (gbox_matched[:, 3:] - gbox_matched[:, :3]).clamp_min(0.0)
+                size_errs.append(
+                    (p_size - g_size).abs().sum(dim=-1)                       # (G,)
+                )
 
                 primary = int(
                     input_dict.get("primary_object_id", [0] * B)[b]
@@ -306,6 +339,8 @@ class Locate3DLocalizer(nn.Module):
             query_entropy = torch.zeros((), device=device)
             primary_iou = torch.zeros((), device=device)
             unique_ratio = torch.zeros((), device=device)
+            center_dist_mean = torch.zeros((), device=device)
+            size_err_mean = torch.zeros((), device=device)
         else:
             all_q = torch.cat(all_matched_q)            # (M,)
             hist = torch.bincount(all_q, minlength=Q).float()
@@ -318,6 +353,14 @@ class Locate3DLocalizer(nn.Module):
                 torch.stack(match_iou_primary).mean()
                 if len(match_iou_primary) > 0
                 else torch.zeros((), device=device)
+            )
+            center_dist_mean = (
+                torch.cat(center_dists).mean()
+                if len(center_dists) > 0 else torch.zeros((), device=device)
+            )
+            size_err_mean = (
+                torch.cat(size_errs).mean()
+                if len(size_errs) > 0 else torch.zeros((), device=device)
             )
 
         coverage = torch.tensor(
@@ -342,6 +385,14 @@ class Locate3DLocalizer(nn.Module):
             # If this is high but dbg_match_iou is low, the matcher, not the
             # head, is the problem.
             "dbg_topk_recall25": topk_rec.detach(),
+            # IoU-independent box regression diagnostics. dbg_match_center_dist
+            # is the L2 distance in meters between matched query center and GT
+            # center -- shows whether the center is moving toward GT even when
+            # IoU=0 (boxes still don't overlap). dbg_match_size_err is the L1
+            # extent error summed over 3 axes. If both are stuck epoch-over-
+            # epoch, bbox regression has stopped learning (grad issue).
+            "dbg_match_center_dist": center_dist_mean.detach().float(),
+            "dbg_match_size_err": size_err_mean.detach().float(),
             "dbg_center_std": center_std.detach().float(),
             "dbg_size_std": size_std.detach().float(),
             "dbg_query_entropy": query_entropy.detach().float(),

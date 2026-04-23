@@ -412,6 +412,10 @@ class Locate3DDebugPrinter(HookBase):
             "dbg_match_iou",
             "dbg_match_iou_primary",
             "dbg_gt_covered25",
+            "dbg_all_gt_covered25",
+            "dbg_topk_recall25",
+            "dbg_match_center_dist",
+            "dbg_match_size_err",
             "dbg_center_std",
             "dbg_size_std",
             "dbg_query_entropy",
@@ -421,3 +425,106 @@ class Locate3DDebugPrinter(HookBase):
                 msg.append(f"{k}={out[k].item():.3f}")
         if msg:
             self.trainer.logger.info("[Locate3D debug] " + " ".join(msg))
+
+
+@HOOKS.register_module()
+class Locate3DStartupSanity(HookBase):
+    """Runs once, before training starts, to surface common silent failures:
+
+    - Backbone parameter coverage: how many params in the backbone got loaded
+      from the checkpoint vs left at random init. If Utonia's pretrained
+      encoder dropped ("Missing keys" in CheckpointLoader log covered
+      everything important), this will scream.
+    - Point-cloud encoding shape on a real batch: prints the (N_points,
+      feat_dim) of the tensor reaching the Locate-3D decoder. For 0c/0e/0g
+      you want feat_dim==576 (or 432 for 0g) and N_points in the 100s-1000s;
+      for 0d you want feat_dim==54 and N_points ~ tens of thousands.
+    - BBoxHead final-Linear weight norm. If it is still ~0 after an epoch,
+      gradients are not flowing -- check clip_grad / loss weights.
+
+    Register this BEFORE the iteration timer so it runs early; outputs a
+    single INFO line block per rank-0.
+    """
+
+    def __init__(self, sample_index=0):
+        self.sample_index = int(sample_index)
+        self._dumped_startup = False
+        self._epoch_marker = -1
+
+    def _find_backbone(self):
+        # Unwrap DDP
+        m = self.trainer.model
+        if hasattr(m, "module"):
+            m = m.module
+        return getattr(m, "backbone", None), getattr(m, "decoder", None), m
+
+    def before_train(self):
+        if not comm.is_main_process():
+            return
+        backbone, decoder, model = self._find_backbone()
+        if backbone is None:
+            self.trainer.logger.info(
+                "[Locate3D sanity] model has no 'backbone' attribute; skip"
+            )
+            return
+
+        # Parameter coverage: crude heuristic -- report fraction of backbone
+        # params whose absolute mean is below a small threshold (likely
+        # still at init). NOT a perfect signal but pairs well with the
+        # CheckpointLoader 'Missing keys:' log.
+        total = trained_like = random_like = 0
+        for n, p in backbone.named_parameters():
+            total += 1
+            m = p.detach().float().abs().mean().item()
+            # Kaiming / trunc_normal init usually has mean |x| ~ 0.01-0.05;
+            # pretrained weights generally have larger abs mean. This is
+            # loose but surfaces the "everything is pristine random init"
+            # failure mode.
+            if m > 0.08:
+                trained_like += 1
+            else:
+                random_like += 1
+
+        self.trainer.logger.info(
+            "[Locate3D sanity] backbone params: {} total; "
+            "{} look pretrained-like, {} look random-like "
+            "(heuristic on |w|.mean()).".format(total, trained_like, random_like)
+        )
+
+        # BBoxHead final-linear weight norm
+        if decoder is not None and hasattr(decoder, "bbox_head"):
+            try:
+                final_lin = decoder.bbox_head.bbox_predictor[-1]
+                wn = final_lin.weight.detach().float().norm().item()
+                bn = final_lin.bias.detach().float().norm().item()
+                self.trainer.logger.info(
+                    f"[Locate3D sanity] bbox_head final linear weight norm "
+                    f"= {wn:.4f}, bias norm = {bn:.4f} "
+                    f"(expected ~0 at init; grow >0.1 once learning starts)"
+                )
+            except (AttributeError, IndexError, TypeError):
+                pass
+
+    def after_epoch(self):
+        # Re-check the bbox head once per epoch so the user sees whether its
+        # weights are actually moving.
+        if not comm.is_main_process():
+            return
+        if self.trainer.epoch == self._epoch_marker:
+            return
+        self._epoch_marker = self.trainer.epoch
+        _, decoder, _ = self._find_backbone()
+        if decoder is None or not hasattr(decoder, "bbox_head"):
+            return
+        try:
+            final_lin = decoder.bbox_head.bbox_predictor[-1]
+            wn = final_lin.weight.detach().float().norm().item()
+            bn = final_lin.bias.detach().float().norm().item()
+            self.trainer.logger.info(
+                "[Locate3D sanity] epoch {} end: bbox_head final linear "
+                "weight norm = {:.4f}, bias norm = {:.4f}".format(
+                    self.trainer.epoch + 1, wn, bn
+                )
+            )
+        except (AttributeError, IndexError, TypeError):
+            pass

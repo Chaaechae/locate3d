@@ -1,38 +1,33 @@
 """
-Variant 0d: keep the full-resolution U-Net decoder but TRAIN IT from scratch,
-freezing only the pretrained encoder.
+Variant 0g: use the STAGE-3 encoder feature (1/8 res, 432-d) instead of the
+bottleneck. This is the level Utonia's 2D-3D DINOv2 alignment actually
+trained ("enc2d_upcast_level=3").
 
-Why this config exists
-----------------------
-0c switches to ``enc_mode=True`` to dodge the random-U-Net-decoder problem
-but pays a ~16x resolution cost (0.32 m voxels). If that coarse resolution
-caps Acc@0.25 below what we need, the alternative is to keep
-``enc_mode=False`` (54-dim at original resolution) BUT actually train the
-U-Net decoder stack from scratch while the pretrained encoder stays frozen.
+Why
+---
+- 0c uses ``enc_mode=True`` returning the bottleneck (stride 16, 576 ch).
+  But Utonia's pretext connects the DINOv2 image-patch alignment head at
+  stage 3 of the encoder (432 ch, stride 8), not at the bottleneck. The
+  bottleneck is only supervised by masked-patch reconstruction, which is
+  a local-geometry objective; the stage-3 features are what carry the
+  semantic, DINOv2-adjacent structure that language-grounding benefits
+  from.
+- Stage-3 resolution is stride 8 vs 16 → 2x finer voxel spacing (0.16 m
+  vs 0.32 m). For median ARKitScenes GT size (0.45 m) that's 2-3 voxels
+  across instead of 1-2 — enough for non-trivial IoU.
+- Channel count 432 vs 576 is negligibly different after the
+  ``feat_proj: Linear(432, 256)`` bottleneck.
 
-This is exactly the recipe used by ``semseg-utonia-v1m1-0b-scannet-dec.py``,
-which successfully trains the same U-Net decoder (ScanNet dense labels, 800
-epochs). We replicate the knobs here: ``freeze_encoder=True`` inside the
-backbone config + ``freeze_backbone=False`` at the model level so that only
-the encoder's ``embedding`` + ``enc`` stacks freeze, and the ``dec`` stack
-gets real gradients.
-
-Tradeoffs
----------
-- (+) Full voxel-grid-size resolution for the decoder's cross-attention.
-- (+) Final feature dim is 54 (cheap to project to d_model=768).
-- (-) U-Net decoder is ~3.7M params starting from random init. On 991
-  annotations × 50 epochs = ~50k updates that WILL NOT converge. We bump
-  ``loop=10`` → 500k updates. Still an order of magnitude less than the
-  semseg-dec recipe, but sparse referring-expression loss alone is a weaker
-  training signal than dense per-point classification, so this is the
-  practical ceiling without extra data.
-- (-) Slower per-step (decoder cross-attention over ~20-40k points).
+We access stage-3 via the GridPooling ``pooling_parent`` chain: the
+bottleneck point's parent IS the stage-3 point (encoded at 432 ch after
+that stage's Block stack but before the final pool). The new
+``Locate3DLocalizer.backbone_feature_level=1`` knob steps up one level
+from whatever the backbone returns.
 
 How to run
 ----------
     python tools/train.py \\
-        --config-file configs/utonia/localize-utonia-v1m1-0d-arkitscenes.py \\
+        --config-file configs/utonia/localize-utonia-v1m1-0g-arkitscenes.py \\
         -w /group-volume/utonia.pth \\
         --num-gpus <N>
 """
@@ -71,13 +66,20 @@ decoder_cfg = dict(
     transformer_use_checkpointing=True,
     freeze_text_encoder=True,
     text_encoder="clip",
+    text_conditioned_queries=True,
 )
 
 model = dict(
     type="Locate3DLocalizer",
-    backbone_out_channels=54,             # U-Net decoder output
+    # Stage-3 encoder channels. PT-v3m3 enc_channels=(54,108,216,432,576),
+    # so stage 3 (zero-indexed) = 432.
+    backbone_out_channels=432,
     decoder_input_feat_dim=256,
-    freeze_backbone=False,                # let the U-Net dec stack train
+    freeze_backbone=True,
+    # KEY: step 1 level up from the backbone's returned point. Combined
+    # with enc_mode=True (returns bottleneck = stage 4), this lands us on
+    # stage 3 (432 ch at stride 8).
+    backbone_feature_level=1,
     backbone=dict(
         type="PT-v3m3",
         in_channels=9,
@@ -96,7 +98,7 @@ model = dict(
         qk_scale=None,
         attn_drop=0.0,
         proj_drop=0.0,
-        drop_path=0.3,
+        drop_path=0.0,
         shuffle_orders=True,
         pre_norm=True,
         enable_rpe=False,
@@ -105,12 +107,12 @@ model = dict(
         upcast_softmax=False,
         traceable=False,
         mask_token=False,
-        enc_mode=False,                   # full U-Net forward
-        freeze_encoder=True,              # freeze ONLY pretrained encoder part
+        enc_mode=True,
+        freeze_encoder=False,
         rope_base=10,
         shift_coords=None,
-        jitter_coords=1.1,
-        rescale_coords=1.2,
+        jitter_coords=None,
+        rescale_coords=None,
     ),
     decoder=decoder_cfg,
     matcher_cost_class=1.0,
@@ -124,27 +126,23 @@ model = dict(
     focal_alpha=0.25,
     focal_gamma=2.0,
     aux_loss=True,
-    max_points_train=40000,
-    max_points_eval=40000,
+    aux_layer_weights=(0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8),
+    max_points_train=None,
+    max_points_eval=None,
 )
 
-# Per-param-group LR: give the U-Net decoder a higher LR than the Locate-3D
-# decoder so it can actually learn from random init in 50 epochs. Keyword
-# "backbone.dec" matches only the U-Net decoder submodule inside the
-# backbone; the frozen encoder has requires_grad=False and is skipped.
-epoch = 100                               # 2x the 0a/0b budget
-eval_epoch = 100
-base_lr = 2e-4
+epoch = 50
+eval_epoch = 50
+base_lr = 1e-4
 optimizer = dict(type="AdamW", lr=base_lr, weight_decay=0.01)
 scheduler = dict(
     type="OneCycleLR",
-    max_lr=[base_lr, base_lr * 2],        # Locate-3D decoder at base_lr, U-Net dec at 2x
+    max_lr=base_lr,
     pct_start=0.05,
     anneal_strategy="cos",
     div_factor=10.0,
     final_div_factor=1000.0,
 )
-param_dicts = [dict(keyword="backbone.dec", lr=base_lr * 2)]
 
 train_transform = [
     dict(type="ChromaticAutoContrast", p=0.2, blend_factor=None),
@@ -211,7 +209,7 @@ data = dict(
         split=("Training", "Validation"),
         transform=train_transform,
         test_mode=False,
-        loop=10,                           # 10x per-epoch iterations
+        loop=10,
     ),
     val=dict(
         type="ARKitScenesLocate3DDataset",
