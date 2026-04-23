@@ -55,14 +55,19 @@ enable_wandb = False
 train = dict(type="Locate3DTrainer")
 
 # --------- dataset paths (EDIT THESE TO YOUR ENVIRONMENT) ---------
+# Pointcept-preprocessed per-scene ``.npy`` trees. Layout on user's box:
+#   /group-volume/3Ddataset/{arkitscenes,scannet,scannetpp}-compressed/
+#     {train,val,test}/<scene_id>/{coord,color,normal,instance,...}.npy
 arkit_root = "/group-volume/3Ddataset/arkitscenes-compressed"
-scannet_root = "/group-volume/3Ddataset/scannet"
-scannetpp_root = "/group-volume/3Ddataset/scannetpp"
+scannet_root = "/group-volume/3Ddataset/scannet-compressed"
+scannetpp_root = "/group-volume/3Ddataset/scannetpp-compressed"
 
-# Annotation JSONs. ARKit ones are in this repo; for ScanNet / ScanNet++
-# you'll need the corresponding Locate-3D JSONs (published alongside
-# train_arkitscenes.json / val_arkitscenes.json). Set to None for any
-# dataset you want to skip.
+# Annotation JSONs. ARKit ones ship with this repo. The ScanNet /
+# ScanNet++ JSONs are published at
+# https://github.com/facebookresearch/locate-3d/tree/main/locate3d_data/dataset
+# -- copy them into ``locate-3d/locate3d_data/`` (same dir as the ARKit
+# JSONs) and the adapter will pick them up automatically. Set any
+# ``*_ann`` path to None to exclude that corpus from the run.
 arkit_train_ann = "locate-3d/locate3d_data/train_arkitscenes.json"
 arkit_val_ann = "locate-3d/locate3d_data/val_arkitscenes.json"
 scannet_train_ann = "locate-3d/locate3d_data/train_scannet.json"

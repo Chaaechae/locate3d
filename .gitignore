@@ -14,3 +14,11 @@ outputs/
 */.DS_Store
 **/*.out
 Dockerfile
+
+# Locate-3D large annotation JSONs fetched by tools/fetch_locate3d_jsons.sh;
+# license (CC-by-NC) + size (~100 MB) make committing them undesirable.
+# The 1 MB ARKit JSONs stay in git.
+locate-3d/locate3d_data/train_scannet.json
+locate-3d/locate3d_data/val_scannet.json
+locate-3d/locate3d_data/train_scannetpp.json
+locate-3d/locate3d_data/val_scannetpp.json

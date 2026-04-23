@@ -120,15 +120,27 @@ def _load_scene_generic(scene_dir, required=("coord", "instance"), optional=("co
 
 # --- base adapter shared by ScanNet / ScanNetPP ---------------------------
 
+def _norm_tag(s):
+    """Normalize a scene_dataset tag for comparison: lowercase only.
+    Preserves distinguishing punctuation like the '++' in 'ScanNet++'
+    so we can tell the ScanNet and ScanNet++ splits apart (they share
+    the prefix 'scannet'). Callers should supply all accepted variants
+    (e.g. ("scannet++", "scannetpp"))."""
+    return str(s).lower()
+
+
 class _BaseScanNetFamilyLocate3DDataset(Dataset):
     """Common logic for both ScanNet and ScanNet++ Locate-3D adapters.
 
-    Subclasses set ``DATASET_TAG`` (used for filtering the annotation JSON
-    by ``scene_dataset`` field) and ``DEFAULT_SPLIT_DIRS`` (the sub-
-    directories under ``data_root`` that contain per-scene folders).
+    Subclasses set ``DATASET_TAGS`` (tuple of scene_dataset string
+    variants this adapter should accept, normalized via _norm_tag) and
+    ``DEFAULT_SPLIT_DIRS`` (the sub-directories under ``data_root`` that
+    contain per-scene folders).
     """
 
-    DATASET_TAG = ""          # e.g. "ScanNet", "ScanNetPP"
+    # Tuple of accepted scene_dataset values (already normalized by
+    # _norm_tag). Example: ("scannet",) or ("scannetpp", "scannet").
+    DATASET_TAGS = ()
     DEFAULT_SPLIT_DIRS = ("train", "val")
 
     def __init__(
@@ -162,10 +174,11 @@ class _BaseScanNetFamilyLocate3DDataset(Dataset):
 
         # Filter annotations by this adapter's dataset tag (the same JSON
         # may contain rows from ScanNet + ScanNet++ + ARKitScenes).
-        if self.DATASET_TAG:
+        if self.DATASET_TAGS:
+            accept = set(self.DATASET_TAGS)
             anns = [
                 a for a in anns
-                if str(a.get("scene_dataset", "")).lower() == self.DATASET_TAG.lower()
+                if _norm_tag(a.get("scene_dataset", "")) in accept
             ]
 
         self.scene_dirs = self._index_scenes()
@@ -338,11 +351,16 @@ class _BaseScanNetFamilyLocate3DDataset(Dataset):
 
 @DATASETS.register_module()
 class ScanNetLocate3DDataset(_BaseScanNetFamilyLocate3DDataset):
-    DATASET_TAG = "ScanNet"
+    # normalized "ScanNet" -> "scannet". Match only exact ScanNet rows;
+    # we intentionally exclude "scannetpp" / "scannet++" since those
+    # belong to ScanNet++ adapter.
+    DATASET_TAGS = ("scannet",)
     DEFAULT_SPLIT_DIRS = ("train", "val")
 
 
 @DATASETS.register_module()
 class ScanNetPPLocate3DDataset(_BaseScanNetFamilyLocate3DDataset):
-    DATASET_TAG = "ScanNetPP"
+    # official Meta JSONs use scene_dataset="ScanNet++" (with the plus
+    # signs). Accept the common variants so we match regardless.
+    DATASET_TAGS = ("scannetpp", "scannet++")
     DEFAULT_SPLIT_DIRS = ("train", "val")
