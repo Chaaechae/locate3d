@@ -355,6 +355,60 @@ class RandomFlip(object):
 
 
 @TRANSFORMS.register_module()
+class RandomFlipBoxAware(object):
+    """Independent 50% flips along X and Y that also mirror axis-aligned
+    ``boxes_xyzxyz`` annotations. Z-flip is omitted because indoor scenes are
+    gravity-aligned. Preserves axis-aligned bounding-box semantics, so safe to
+    use with the Locate-3D set-prediction loss. Unlike ``RandomFlip`` which
+    only touches ``coord``/``normal``, this transform keeps GT boxes and
+    point cloud in the same frame.
+    """
+
+    def __init__(self, p=0.5):
+        self.p = p
+
+    def _flip_axis(self, data_dict, axis):
+        if "coord" in data_dict:
+            data_dict["coord"][:, axis] = -data_dict["coord"][:, axis]
+        if "normal" in data_dict:
+            data_dict["normal"][:, axis] = -data_dict["normal"][:, axis]
+        b = data_dict.get("boxes_xyzxyz", None)
+        if b is not None:
+            # box = (xmin, ymin, zmin, xmax, ymax, zmax)
+            lo = -b[:, axis + 3].copy()
+            hi = -b[:, axis].copy()
+            b[:, axis] = lo
+            b[:, axis + 3] = hi
+            data_dict["boxes_xyzxyz"] = b
+
+    def __call__(self, data_dict):
+        if np.random.rand() < self.p:
+            self._flip_axis(data_dict, 0)
+        if np.random.rand() < self.p:
+            self._flip_axis(data_dict, 1)
+        return data_dict
+
+
+@TRANSFORMS.register_module()
+class RandomScaleBoxAware(object):
+    """Isotropic random scale that scales ``coord`` AND ``boxes_xyzxyz`` by
+    the same factor, preserving axis-aligned box semantics. Safe with
+    Locate-3D's L1 / GIoU loss."""
+
+    def __init__(self, scale=(0.9, 1.1)):
+        self.scale = scale
+
+    def __call__(self, data_dict):
+        s = float(np.random.uniform(self.scale[0], self.scale[1]))
+        if "coord" in data_dict:
+            data_dict["coord"] = data_dict["coord"] * s
+        b = data_dict.get("boxes_xyzxyz", None)
+        if b is not None:
+            data_dict["boxes_xyzxyz"] = b * s
+        return data_dict
+
+
+@TRANSFORMS.register_module()
 class RandomJitter(object):
     def __init__(self, sigma=0.01, clip=0.05):
         assert clip > 0

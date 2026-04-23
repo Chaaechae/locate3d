@@ -66,6 +66,7 @@ class Locate3DCriterion(nn.Module):
         focal_alpha: float = 0.25,
         focal_gamma: float = 2.0,
         aux_loss: bool = True,
+        aux_layer_weights=None,
     ):
         super().__init__()
         self.matcher = matcher
@@ -77,6 +78,16 @@ class Locate3DCriterion(nn.Module):
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
         self.aux_loss = aux_loss
+        # aux_layer_weights: optional per-aux-layer multiplier on the weighted
+        # loss contribution. Index 0 = earliest aux layer. The final (non-aux)
+        # layer is always weighted 1.0. None → every aux layer is weighted 1.0
+        # (original behavior). A linear ramp (e.g. 0.2→0.8 across 7 aux layers)
+        # prevents the shared BBoxHead from being dominated by the noisy
+        # early-layer query states -- helpful when the encoder features are
+        # not already CLIP-aligned and early queries take longer to specialize.
+        self.aux_layer_weights = (
+            tuple(aux_layer_weights) if aux_layer_weights is not None else None
+        )
 
     def _single_layer_loss(self, outputs, targets, indices, num_boxes):
         losses = {}
@@ -198,21 +209,34 @@ class Locate3DCriterion(nn.Module):
                 for k, v in aux_losses.items():
                     losses[f"{k}_aux_{i}"] = v
 
-        # total weighted loss
+        # total weighted loss. Per-key scalars in ``losses`` are kept at their
+        # raw values (InformationWriter logs them); only ``losses["loss"]`` --
+        # the backpropped total -- applies the per-layer weights.
         total = torch.zeros((), device=device)
         for k, v in losses.items():
             if k.startswith("_"):
                 continue
-            base = k.split("_aux_")[0]
+            if "_aux_" in k:
+                base, aux_idx_s = k.split("_aux_")
+                aux_idx = int(aux_idx_s)
+                if self.aux_layer_weights is not None and aux_idx < len(
+                    self.aux_layer_weights
+                ):
+                    w_layer = float(self.aux_layer_weights[aux_idx])
+                else:
+                    w_layer = 1.0
+            else:
+                base = k
+                w_layer = 1.0
             if base == "loss_class":
-                total = total + self.weight_class * v
+                total = total + w_layer * self.weight_class * v
             elif base == "loss_bbox":
-                total = total + self.weight_bbox * v
+                total = total + w_layer * self.weight_bbox * v
             elif base == "loss_giou":
-                total = total + self.weight_giou * v
+                total = total + w_layer * self.weight_giou * v
             elif base == "loss_mask_bce":
-                total = total + self.weight_mask_bce * v
+                total = total + w_layer * self.weight_mask_bce * v
             elif base == "loss_mask_dice":
-                total = total + self.weight_mask_dice * v
+                total = total + w_layer * self.weight_mask_dice * v
         losses["loss"] = total
         return losses

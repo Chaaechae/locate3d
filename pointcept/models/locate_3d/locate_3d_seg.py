@@ -70,6 +70,7 @@ class Locate3DLocalizer(nn.Module):
         focal_alpha: float = 0.25,
         focal_gamma: float = 2.0,
         aux_loss: bool = True,
+        aux_layer_weights=None,
         max_points_train: int = 40000,
         max_points_eval: int = 60000,
     ):
@@ -100,6 +101,7 @@ class Locate3DLocalizer(nn.Module):
             focal_alpha=focal_alpha,
             focal_gamma=focal_gamma,
             aux_loss=aux_loss,
+            aux_layer_weights=aux_layer_weights,
         )
         self.max_points_train = max_points_train
         self.max_points_eval = max_points_eval
@@ -111,13 +113,24 @@ class Locate3DLocalizer(nn.Module):
                 point = self.backbone(point)
         else:
             point = self.backbone(point)
-        # U-Net decoder recovery: collapse any residual pooling stack
+        # Discard the pooling chain recorded by GridPooling(traceable=True).
+        # Two cases:
+        #   - enc_mode=False: the U-Net ``dec`` stack already walked and consumed the
+        #     chain via GridUnpooling, so this loop is a no-op.
+        #   - enc_mode=True: ``dec`` was skipped, so the pooling_parent chain is still
+        #     attached to the bottleneck point. We must NOT try to reconstruct a
+        #     full-resolution feature by channel-concat -- that would produce
+        #     ~1386-d features (sum of enc_channels) from random-init paths since
+        #     no decoder weights were used, and break the
+        #     ``feat_proj=Linear(backbone_out_channels, 256)`` head downstream.
+        # In both cases we just drop references so Python can free the up-stream
+        # per-level Point objects instead of keeping the full pyramid in memory.
         if isinstance(point, Point):
             while "pooling_parent" in point.keys():
-                parent = point.pop("pooling_parent")
-                inverse = point.pop("pooling_inverse")
-                parent.feat = torch.cat([parent.feat, point.feat[inverse]], dim=-1)
-                point = parent
+                point.pop("pooling_parent")
+                point.pop("pooling_inverse")
+                if "idx_ptr" in point.keys():
+                    point.pop("idx_ptr")
         return point
 
     def _encode(self, input_dict):
@@ -225,30 +238,68 @@ class Locate3DLocalizer(nn.Module):
         center_std = centers.std(dim=1).mean()     # avg across xyz & batch
         size_std = sizes.std(dim=1).mean()
 
+        # Text-alignment score per query (max over valid tokens of sigmoid logits).
+        # Used for the top-K recall metric below.
+        text_attn_mask = outputs.get("text_attn_mask", None)
+        if text_attn_mask is not None:
+            valid_tok = (~text_attn_mask).to(pred_logits.dtype)               # (B, T)
+            neg_inf = pred_logits.new_tensor(float("-inf"))
+            logits_masked = torch.where(
+                valid_tok.unsqueeze(1).bool(), pred_logits, neg_inf
+            )
+            query_score = logits_masked.sigmoid().amax(dim=-1)                # (B, Q)
+        else:
+            query_score = pred_logits.sigmoid().amax(dim=-1)
+
         # Matched query usage + matching-quality.
         all_matched_q = []
         match_ious = []
         match_iou_primary = []
         gt_covered = 0
         num_gt_total = 0
+        samples_all_covered = 0           # per-sample: every GT in matched pair > 0.25
+        topk_recall_hits = 0              # per-sample: top-K by text score covers every GT
+        num_nonempty_samples = 0
         for b, (src, tgt) in enumerate(indices):
-            num_gt_total += int(targets[b]["boxes_xyzxyz"].shape[0])
-            if len(src) == 0:
+            n_gt_b = int(targets[b]["boxes_xyzxyz"].shape[0])
+            num_gt_total += n_gt_b
+            if n_gt_b == 0:
                 continue
-            all_matched_q.append(src.to(device))
-            pbox = pred_boxes[b, src]                               # (G, 6)
-            gbox = targets[b]["boxes_xyzxyz"].to(device)[tgt]       # (G, 6)
-            iou = torch.diagonal(box_iou_3d(pbox, gbox)[0])          # (G,)
-            match_ious.append(iou)
-            gt_covered += int((iou > 0.25).sum().item())
-            primary = int(input_dict.get("primary_object_id", [0]*B)[b]
-                          if not isinstance(input_dict.get("primary_object_id", [0]*B)[b], torch.Tensor)
-                          else input_dict["primary_object_id"][b].flatten()[0].item())
-            # If the primary gt was matched, record its IoU.
-            tgt_cpu = tgt.cpu().tolist() if isinstance(tgt, torch.Tensor) else list(tgt)
-            if primary in tgt_cpu:
-                pos_in_matched = tgt_cpu.index(primary)
-                match_iou_primary.append(iou[pos_in_matched])
+            num_nonempty_samples += 1
+            gbox_b = targets[b]["boxes_xyzxyz"].to(device)                    # (G, 6)
+
+            # Match-based metrics (only meaningful when everyone was matched).
+            if len(src) > 0:
+                all_matched_q.append(src.to(device))
+                pbox = pred_boxes[b, src]                                     # (G, 6)
+                gbox_matched = gbox_b[tgt]
+                iou = torch.diagonal(box_iou_3d(pbox, gbox_matched)[0])       # (G,)
+                match_ious.append(iou)
+                gt_covered += int((iou > 0.25).sum().item())
+                if len(src) == n_gt_b and bool((iou > 0.25).all()):
+                    samples_all_covered += 1
+
+                primary = int(
+                    input_dict.get("primary_object_id", [0] * B)[b]
+                    if not isinstance(
+                        input_dict.get("primary_object_id", [0] * B)[b], torch.Tensor
+                    )
+                    else input_dict["primary_object_id"][b].flatten()[0].item()
+                )
+                tgt_cpu = tgt.cpu().tolist() if isinstance(tgt, torch.Tensor) else list(tgt)
+                if primary in tgt_cpu:
+                    match_iou_primary.append(iou[tgt_cpu.index(primary)])
+
+            # Top-K-by-text-score recall: does the top-K set of queries cover
+            # every GT at IoU > 0.25? Measures "if the matcher were perfect,
+            # would the scored queries still localize all entities?"
+            topk = min(n_gt_b, pred_boxes.shape[1])
+            if topk > 0:
+                _, top_idx = torch.topk(query_score[b], k=topk)
+                top_boxes = pred_boxes[b, top_idx]                            # (K, 6)
+                pairwise = box_iou_3d(top_boxes, gbox_b)[0]                   # (K, G)
+                if bool((pairwise.max(dim=0).values > 0.25).all()):
+                    topk_recall_hits += 1
 
         if len(all_matched_q) == 0:
             match_iou = torch.zeros((), device=device)
@@ -272,11 +323,25 @@ class Locate3DLocalizer(nn.Module):
         coverage = torch.tensor(
             gt_covered / max(num_gt_total, 1), device=device, dtype=torch.float32
         )
+        all_cov = torch.tensor(
+            samples_all_covered / max(num_nonempty_samples, 1),
+            device=device, dtype=torch.float32,
+        )
+        topk_rec = torch.tensor(
+            topk_recall_hits / max(num_nonempty_samples, 1),
+            device=device, dtype=torch.float32,
+        )
 
         return {
             "dbg_match_iou": match_iou.detach().float(),
             "dbg_match_iou_primary": primary_iou.detach().float(),
             "dbg_gt_covered25": coverage.detach(),
+            # Sample-level strict coverage: every GT entity matched at IoU>0.25.
+            "dbg_all_gt_covered25": all_cov.detach(),
+            # Upper-bound recall: top-K-by-text-score queries cover every GT.
+            # If this is high but dbg_match_iou is low, the matcher, not the
+            # head, is the problem.
+            "dbg_topk_recall25": topk_rec.detach(),
             "dbg_center_std": center_std.detach().float(),
             "dbg_size_std": size_std.detach().float(),
             "dbg_query_entropy": query_entropy.detach().float(),

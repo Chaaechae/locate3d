@@ -231,6 +231,7 @@ class Locate3DDecoder(nn.Module):
         transformer_use_checkpointing=True,
         freeze_text_encoder=True,
         text_encoder="clip",
+        text_conditioned_queries=False,
     ):
         super().__init__()
         # Import here to allow models that are not using text encoders to avoid
@@ -266,6 +267,23 @@ class Locate3DDecoder(nn.Module):
 
         self.query_feat = nn.Embedding(num_queries, d_model)
         self.query_pos = nn.Embedding(num_queries, d_model)
+
+        # Optional: seed every query's content with a pooled text embedding at
+        # step 0. Official Locate-3D uses plain nn.Embedding here and relies on
+        # 3D-JEPA's strong CLIP-adjacent features to specialize queries during
+        # the first few layers of self-attention. With a non-CLIP-aligned
+        # encoder (Utonia) the symmetry break takes too many epochs on a small
+        # dataset, so we allow injecting a text bias into the initial content.
+        # Zero-init so step-0 behavior is bit-exact for compatibility; the
+        # module only starts contributing once its weights move.
+        self.text_conditioned_queries = text_conditioned_queries
+        if text_conditioned_queries:
+            self.query_text_init = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.LayerNorm(d_model, eps=1e-12),
+            )
+            nn.init.zeros_(self.query_text_init[0].weight)
+            nn.init.zeros_(self.query_text_init[0].bias)
 
         # Spatial anchors so different queries are biased to different scene
         # regions from the very first forward. Without this, every query's
@@ -372,6 +390,17 @@ class Locate3DDecoder(nn.Module):
         query_mask = torch.cat([query_false, text_pad_mask], dim=1)
 
         query_feats = self.query_feat.weight.unsqueeze(0).repeat(B, 1, 1)
+
+        # Optional text-pool bias on query content (see __init__ docstring).
+        # Pools text_feats over valid tokens into a (B, d_model) caption summary
+        # and broadcasts it across all Q queries as a content bias. Zero-init of
+        # query_text_init means no numerical change at step 0.
+        if self.text_conditioned_queries:
+            valid_t = (~text_pad_mask).to(text_feats.dtype).unsqueeze(-1)      # (B, T, 1)
+            text_pooled = (text_feats * valid_t).sum(1) / valid_t.sum(1).clamp_min(1.0)
+            text_bias = self.query_text_init(text_pooled).unsqueeze(1)         # (B, 1, d_model)
+            query_feats = query_feats + text_bias
+
         # Per-query positional embedding = learned embedding + spatial-anchor
         # embedding (same MLP that encodes point xyz). This gives each query
         # a distinct spatial bias from epoch 0, so cross-attention naturally
