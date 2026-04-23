@@ -479,7 +479,17 @@ class Locate3DStartupSanity(HookBase):
                 # keyword/replacement from the actual CheckpointLoader hook
                 # registered on the trainer so this stays in sync with config
                 # changes without needing to re-edit this hook.
-                ws = comm.get_world_size()
+                #
+                # Important: CheckpointLoader only strips the "module." prefix
+                # when world_size == 1, because the DDP-wrapped model's
+                # state_dict keys carry "module." only in multi-GPU runs.
+                # Our target set below is ``model.state_dict()`` on the
+                # UNWRAPPED module (we already did ``m = m.module``), which
+                # never has the "module." prefix -- so for a fair overlap
+                # check we strip "module." from the rewritten keys regardless
+                # of world_size. Otherwise a multi-GPU run would falsely
+                # report 0 overlap while CheckpointLoader was actually
+                # loading everything correctly against the wrapped model.
                 kw, rep = "", ""
                 for h in getattr(self.trainer, "hooks", []):
                     if h.__class__.__name__ == "CheckpointLoader":
@@ -491,12 +501,13 @@ class Locate3DStartupSanity(HookBase):
                     k2 = k if k.startswith("module.") else "module." + k
                     if kw and kw in k2:
                         k2 = k2.replace(kw, rep, 1)
-                    if ws == 1:
-                        k2 = k2[7:]  # drop "module."
+                    # canonical form: always drop the "module." prefix so the
+                    # comparison is against UNWRAPPED model keys
+                    if k2.startswith("module."):
+                        k2 = k2[len("module."):]
                     remapped.append(k2)
 
-                # Target: model's backbone state_dict keys, stripped to
-                # match the rewrite convention.
+                # Target: model's backbone state_dict keys (unwrapped model).
                 model_state_keys = list(model.state_dict().keys())
                 backbone_keys = [
                     k for k in model_state_keys if k.startswith("backbone.")
