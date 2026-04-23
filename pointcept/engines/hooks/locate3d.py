@@ -546,7 +546,7 @@ class Locate3DStartupSanity(HookBase):
                         "[Locate3D sanity] examples of model.backbone keys "
                         "(first 5): {}".format(backbone_keys[:5])
                     )
-                    # Try common alternative rewrites and suggest the best one.
+                    # Try common alternative rewrites and auto-apply the best.
                     candidates = [
                         ("module.student.backbone", "module.backbone"),
                         ("module.", "module.backbone."),
@@ -561,14 +561,45 @@ class Locate3DStartupSanity(HookBase):
                         if cand_loaded > 0 and (best is None or cand_loaded > best[2]):
                             best = (ck, cr, cand_loaded)
                     if best is not None:
+                        best_kw, best_rep, best_cnt = best
                         logger.warning(
-                            "[Locate3D sanity] -> SUGGESTED FIX: switch "
-                            "CheckpointLoader to keywords={!r} -> "
-                            "replacement={!r} (would load {} / {} "
-                            "backbone keys).".format(
-                                best[0], best[1], best[2], len(backbone_keys)
+                            "[Locate3D sanity] -> AUTO-HEALING: reloading ckpt "
+                            "with keywords={!r} -> replacement={!r} "
+                            "(recovers {} / {} backbone keys). Update the "
+                            "config's CheckpointLoader to these values to "
+                            "silence this warning on future runs.".format(
+                                best_kw, best_rep, best_cnt, len(backbone_keys)
                             )
                         )
+                        # Re-map the ckpt state_dict and reload onto the
+                        # DDP-wrapped model using the SAME logic that
+                        # CheckpointLoader itself uses (ws-gated strip).
+                        import pointcept.utils.comm as _comm
+                        ws = _comm.get_world_size()
+                        heal_weight = {}
+                        for k, v in ckpt_sd.items():
+                            k2 = k if k.startswith("module.") else "module." + k
+                            if best_kw and best_kw in k2:
+                                k2 = k2.replace(best_kw, best_rep, 1)
+                            if ws == 1 and k2.startswith("module."):
+                                k2 = k2[len("module."):]
+                            heal_weight[k2] = v
+                        try:
+                            info = self.trainer.model.load_state_dict(
+                                heal_weight, strict=False
+                            )
+                            logger.info(
+                                "[Locate3D sanity] auto-heal reload: "
+                                "missing={} unexpected={}".format(
+                                    len(info.missing_keys),
+                                    len(info.unexpected_keys),
+                                )
+                            )
+                        except (RuntimeError, KeyError) as e:
+                            logger.warning(
+                                "[Locate3D sanity] auto-heal reload "
+                                "failed: {}".format(e)
+                            )
                     else:
                         logger.warning(
                             "[Locate3D sanity] no common rewrite candidate "
