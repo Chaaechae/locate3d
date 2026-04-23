@@ -1048,3 +1048,159 @@ class Locate3DGroundingEvaluator(HookBase):
                 self.trainer.best_metric_value,
             )
         )
+
+
+@HOOKS.register_module()
+class Locate3DSegDetectorEvaluator(HookBase):
+    """Acc@IoU evaluator for ``Locate3DSegDetector`` output.
+
+    SegDetector already emits one box per caption entity via the per-point
+    mask AABB, so unlike ``Locate3DGroundingEvaluator`` there is no query
+    selection step. Reports primary-entity Acc and an "AccAll" across every
+    entity in every caption -- useful for multi-entity monitoring.
+    """
+
+    def __init__(self, iou_thresholds=(0.25, 0.5)):
+        self.iou_thresholds = tuple(iou_thresholds)
+
+    def before_train(self):
+        if self.trainer.writer is not None and self.trainer.cfg.enable_wandb:
+            wandb.define_metric("val/*", step_metric="Epoch")
+
+    def after_epoch(self):
+        if self.trainer.cfg.evaluate:
+            self.eval()
+
+    @staticmethod
+    def _iou_3d(a, b):
+        lt = torch.maximum(a[:3], b[:3])
+        rb = torch.minimum(a[3:], b[3:])
+        wh = (rb - lt).clamp_min(0.0)
+        inter = wh[0] * wh[1] * wh[2]
+        vol_a = (a[3:] - a[:3]).clamp_min(0.0).prod()
+        vol_b = (b[3:] - b[:3]).clamp_min(0.0).prod()
+        union = vol_a + vol_b - inter
+        return (inter / union.clamp_min(1e-6)).item()
+
+    def eval(self):
+        self.trainer.logger.info(
+            ">>>>>>>>>>>>>>>> Start Locate3D SegDet Evaluation >>>>>>>>>>>>>>>>"
+        )
+        self.trainer.model.eval()
+
+        total = 0
+        hits = {t: 0 for t in self.iou_thresholds}
+        total_all = 0
+        hits_all = {t: 0 for t in self.iou_thresholds}
+
+        for i, input_dict in enumerate(self.trainer.val_loader):
+            for key in list(input_dict.keys()):
+                if isinstance(input_dict[key], torch.Tensor):
+                    input_dict[key] = input_dict[key].cuda(non_blocking=True)
+            with torch.no_grad():
+                output_dict = self.trainer.model(input_dict)
+
+            pred_boxes_per = output_dict.get("pred_boxes_per_entity", None)
+            if pred_boxes_per is None:
+                continue
+
+            boxes_list = input_dict["boxes_xyzxyz"]
+            primary_ids = input_dict.get(
+                "primary_object_id", [0] * len(boxes_list)
+            )
+
+            for b in range(len(boxes_list)):
+                pred_b = pred_boxes_per[b]
+                if pred_b is None or pred_b.shape[0] == 0:
+                    continue
+                gt_boxes = boxes_list[b].to(pred_b.device)
+                pid = primary_ids[b] if b < len(primary_ids) else 0
+                if isinstance(pid, torch.Tensor):
+                    primary = int(pid.flatten()[0].item())
+                else:
+                    primary = int(pid)
+                G = int(gt_boxes.shape[0])
+
+                K = min(pred_b.shape[0], G)
+                for g in range(K):
+                    iou = self._iou_3d(pred_b[g], gt_boxes[g])
+                    total_all += 1
+                    for t in self.iou_thresholds:
+                        if iou >= t:
+                            hits_all[t] += 1
+
+                if primary >= G or primary >= pred_b.shape[0]:
+                    continue
+                iou_p = self._iou_3d(pred_b[primary], gt_boxes[primary])
+                total += 1
+                for t in self.iou_thresholds:
+                    if iou_p >= t:
+                        hits[t] += 1
+
+            del output_dict, pred_boxes_per
+            torch.cuda.empty_cache()
+
+        if comm.get_world_size() > 1:
+            total_t = torch.tensor([total], dtype=torch.long, device="cuda")
+            total_all_t = torch.tensor(
+                [total_all], dtype=torch.long, device="cuda"
+            )
+            dist.all_reduce(total_t)
+            dist.all_reduce(total_all_t)
+            total = int(total_t.item())
+            total_all = int(total_all_t.item())
+            for t in self.iou_thresholds:
+                ht = torch.tensor([hits[t]], dtype=torch.long, device="cuda")
+                hta = torch.tensor(
+                    [hits_all[t]], dtype=torch.long, device="cuda"
+                )
+                dist.all_reduce(ht)
+                dist.all_reduce(hta)
+                hits[t] = int(ht.item())
+                hits_all[t] = int(hta.item())
+
+        metrics = {
+            f"Acc@{t:g}": (hits[t] / max(total, 1))
+            for t in self.iou_thresholds
+        }
+        metrics.update(
+            {
+                f"AccAll@{t:g}": (hits_all[t] / max(total_all, 1))
+                for t in self.iou_thresholds
+            }
+        )
+        self.trainer.logger.info(
+            "Val SegDet grounding: "
+            + " / ".join(f"{k}: {v:.4f}" for k, v in metrics.items())
+            + f" (primary N={total}, all-entity N={total_all})"
+        )
+
+        current_epoch = self.trainer.epoch + 1
+        if self.trainer.writer is not None:
+            for k, v in metrics.items():
+                self.trainer.writer.add_scalar(f"val/{k}", v, current_epoch)
+            if self.trainer.cfg.enable_wandb:
+                wandb.log(
+                    {
+                        "Epoch": current_epoch,
+                        **{f"val/{k}": v for k, v in metrics.items()},
+                    },
+                    step=wandb.run.step,
+                )
+
+        key = f"Acc@{self.iou_thresholds[0]:g}"
+        self.trainer.comm_info["current_metric_value"] = metrics[key]
+        self.trainer.comm_info["current_metric_name"] = key
+        self.trainer.comm_info["val_extras"] = {
+            **{f"val_{k}": float(v) for k, v in metrics.items()},
+            "val_num_samples_primary": int(total),
+            "val_num_samples_all": int(total_all),
+        }
+
+    def after_train(self):
+        self.trainer.logger.info(
+            "Best {}: {:.4f}".format(
+                self.trainer.comm_info.get("current_metric_name", "metric"),
+                self.trainer.best_metric_value,
+            )
+        )

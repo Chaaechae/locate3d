@@ -226,6 +226,12 @@ hooks = [
     dict(type="Locate3DStartupSanity"),
     dict(type="IterationTimer", warmup_iter=2),
     dict(type="InformationWriter"),
+    # SegDetector-specific val (writes current_metric_value so CheckpointSaver
+    # has something to compare against; also reports AccAll@IoU across every
+    # mentioned entity, not just the primary one).
+    dict(
+        type="Locate3DSegDetectorEvaluator", iou_thresholds=(0.25, 0.5)
+    ),
     dict(type="Locate3DMetricsLogger", log_train_every=1),
     dict(type="CheckpointSaver", save_freq=None),
 ]
