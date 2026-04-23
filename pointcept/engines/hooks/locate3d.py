@@ -475,14 +475,21 @@ class Locate3DStartupSanity(HookBase):
                     ckpt_sd = ckpt
                 ckpt_keys_raw = list(ckpt_sd.keys())
 
-                # Replicate the CheckpointLoader remap logic.
+                # Replicate the CheckpointLoader remap logic. Read the
+                # keyword/replacement from the actual CheckpointLoader hook
+                # registered on the trainer so this stays in sync with config
+                # changes without needing to re-edit this hook.
                 ws = comm.get_world_size()
-                kw = "module.student.backbone"
-                rep = "module.backbone"
+                kw, rep = "", ""
+                for h in getattr(self.trainer, "hooks", []):
+                    if h.__class__.__name__ == "CheckpointLoader":
+                        kw = getattr(h, "keywords", "")
+                        rep = getattr(h, "replacement", "")
+                        break
                 remapped = []
                 for k in ckpt_keys_raw:
                     k2 = k if k.startswith("module.") else "module." + k
-                    if kw in k2:
+                    if kw and kw in k2:
                         k2 = k2.replace(kw, rep, 1)
                     if ws == 1:
                         k2 = k2[7:]  # drop "module."
@@ -499,6 +506,10 @@ class Locate3DStartupSanity(HookBase):
                 loaded = [k for k in backbone_keys if k in ckpt_set]
                 missing = [k for k in backbone_keys if k not in ckpt_set]
 
+                logger.info(
+                    "[Locate3D sanity] using CheckpointLoader rewrite "
+                    "keywords={!r} -> replacement={!r}".format(kw, rep)
+                )
                 logger.info(
                     "[Locate3D sanity] ckpt file has {} keys; "
                     "model.backbone has {} keys; "

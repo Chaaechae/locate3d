@@ -218,8 +218,8 @@ hooks = [
     # load only the student.backbone weights from the Utonia pretrain ckpt
     dict(
         type="CheckpointLoader",
-        keywords="module.student.backbone",
-        replacement="module.backbone",
+        keywords="module.",
+        replacement="module.backbone.",
     ),
     dict(type="IterationTimer", warmup_iter=2),
     dict(type="InformationWriter"),
