@@ -216,6 +216,11 @@ class Locate3DSegDetector(nn.Module):
 
         positive_maps = input_dict.get("positive_map", None)         # list of (G, T)
         gt_boxes = input_dict.get("boxes_xyzxyz", None)              # list of (G, 6)
+        # Real per-point masks from ScanNet / ScanNet++ (derived from the
+        # scene's ``instance`` labels aligned to the sub-sampled point
+        # cloud). For ARKit, ``gt_masks_list`` will be None and we fall
+        # back to the inside-GT-box indicator.
+        gt_masks_list = input_dict.get("point_masks", None)          # list of (G, N_full)
 
         pred_logits_list = []
         pred_boxes_list = []
@@ -242,10 +247,32 @@ class Locate3DSegDetector(nn.Module):
             logits = (entity_text @ f_b.t()) * scale                 # (G, N_b)
             pred_logits_list.append(logits)
 
-            # Training targets: (G, N_b) mask = point inside GT box g
-            if self.training and gt_boxes is not None:
-                gbox = gt_boxes[b].to(device=device, dtype=c_b.dtype)      # (G, 6)
-                target_mask = _points_in_boxes(c_b, gbox).to(logits.dtype) # (G, N_b)
+            # Training targets: (G, N_b) mask.
+            if self.training and (gt_masks_list is not None or gt_boxes is not None):
+                if gt_masks_list is not None and b < len(gt_masks_list) and gt_masks_list[b] is not None:
+                    # Real instance mask from the dataset. sub_idx[b] maps
+                    # the dataset's mask to the backbone-level subsample.
+                    full_mask = gt_masks_list[b].to(device=device).bool()  # (G, N_full)
+                    if full_mask.shape[1] != c_b.shape[0]:
+                        # mask was built at dataset resolution; subset to
+                        # current sampled indices.
+                        idx_b = sub_idx[b]
+                        if idx_b.numel() == full_mask.shape[1]:
+                            target_mask = full_mask.to(logits.dtype)
+                        else:
+                            # Clamp index against the mask's point axis in
+                            # case of off-by-one mismatches.
+                            idx_b = idx_b[idx_b < full_mask.shape[1]]
+                            target_mask = full_mask[:, idx_b].to(logits.dtype)
+                            # If we had to drop points, keep logits in sync
+                            if target_mask.shape[1] != logits.shape[1]:
+                                logits = logits[:, : target_mask.shape[1]]
+                    else:
+                        target_mask = full_mask.to(logits.dtype)
+                else:
+                    # Fallback: inside-box proxy mask (ARKit: no real mask).
+                    gbox = gt_boxes[b].to(device=device, dtype=c_b.dtype)
+                    target_mask = _points_in_boxes(c_b, gbox).to(logits.dtype)
                 # per-entity BCE. pos_weight rebalances the ~99.9% negative
                 # / ~0.1% positive ratio; without it BCE converges to the
                 # trivial all-negative minimum (predict 0 everywhere) and
