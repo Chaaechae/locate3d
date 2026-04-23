@@ -85,6 +85,14 @@ class Locate3DSegDetector(nn.Module):
         text_encoder: str = "clip",
         loss_weight_bce: float = 1.0,
         loss_weight_dice: float = 1.0,
+        # pos_weight on the BCE positive class. A typical ARKitScenes scene has
+        # ~40k points but only ~40-100 points inside any given GT box (~0.1%).
+        # With pos_weight=None, the BCE is dominated by the 99.9% negatives and
+        # converges to the trivial all-negative minimum (observed: loss_bce
+        # collapses to ~0.04 while loss_dice barely moves). Setting
+        # pos_weight >> 1 rebalances the gradient toward positives. Default
+        # 100 roughly mirrors the neg/pos ratio.
+        bce_pos_weight: float = 100.0,
         max_points_train: int = 40000,
         max_points_eval: int = 40000,
         infer_threshold: float = 0.5,
@@ -124,6 +132,7 @@ class Locate3DSegDetector(nn.Module):
 
         self.loss_weight_bce = loss_weight_bce
         self.loss_weight_dice = loss_weight_dice
+        self.bce_pos_weight = float(bce_pos_weight) if bce_pos_weight else None
         self.max_points_train = max_points_train
         self.max_points_eval = max_points_eval
         self.infer_threshold = infer_threshold
@@ -237,8 +246,14 @@ class Locate3DSegDetector(nn.Module):
             if self.training and gt_boxes is not None:
                 gbox = gt_boxes[b].to(device=device, dtype=c_b.dtype)      # (G, 6)
                 target_mask = _points_in_boxes(c_b, gbox).to(logits.dtype) # (G, N_b)
-                # per-entity BCE
-                pos_weight = None
+                # per-entity BCE. pos_weight rebalances the ~99.9% negative
+                # / ~0.1% positive ratio; without it BCE converges to the
+                # trivial all-negative minimum (predict 0 everywhere) and
+                # stops learning the positive class.
+                if self.bce_pos_weight is not None:
+                    pos_weight = logits.new_tensor(self.bce_pos_weight)
+                else:
+                    pos_weight = None
                 bce = F.binary_cross_entropy_with_logits(
                     logits, target_mask, reduction="mean", pos_weight=pos_weight,
                 )

@@ -84,8 +84,14 @@ model = dict(
     freeze_backbone=False,
     freeze_text_encoder=True,
     text_encoder="clip",
+    # Heavy tilt toward positive-class learning: ARKitScenes per-point mask
+    # is 99.7% negative, so plain BCE collapses to predict-all-zero
+    # (observed at epoch 6: loss_bce -> 0.04, loss_dice only 0.99 -> 0.81).
+    # Rebalance via pos_weight and boost dice weight so the positive
+    # "inside-box" gradient actually drives learning.
     loss_weight_bce=1.0,
-    loss_weight_dice=1.0,
+    loss_weight_dice=5.0,
+    bce_pos_weight=100.0,
     max_points_train=40000,
     max_points_eval=40000,
     infer_threshold=0.5,
