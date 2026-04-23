@@ -176,6 +176,17 @@ class BBoxHead(nn.Module):
             nn.ReLU(),
             nn.Linear(d_model, 6),
         )
+        # Zero-init final projection so that, at step 0, every query predicts
+        # ``offset = 0`` and ``softplus(0) ≈ 0.69 m`` extents regardless of
+        # the attended feature. The Locate3D decoder treats the regressed
+        # center as an offset from the per-query spatial anchor, so zero init
+        # means the initial box is exactly the anchor box. Without this, the
+        # default Kaiming init produces center offsets of ~O(1) m (with
+        # d_model=768 inputs going through LN->ReLU->Linear(768,6)) which
+        # scatter queries far from their anchors, making the Hungarian
+        # matcher unstable and ``loss_bbox`` non-decreasing.
+        nn.init.zeros_(self.bbox_predictor[-1].weight)
+        nn.init.zeros_(self.bbox_predictor[-1].bias)
 
     def _net(self, query_feats, ptc_feats, ptc_xyz, ptc_mask):
         query_feats = self.query_projector(query_feats)
@@ -263,18 +274,27 @@ class Locate3DDecoder(nn.Module):
         # the matched query set collapses to the few that happen to win the
         # text-alignment race -- starving the rest of the bbox head from any
         # gradient. The bbox head learns an offset from each anchor.
-        # Anchors live in the same (centered) coord frame as ptc_xyz / GT
-        # boxes; range [-2, 2] m covers typical centered ARKitScenes scenes.
+        #
+        # Anchors are stored in a NORMALIZED [-1, 1]^3 frame and re-scaled at
+        # every forward using the AABB of the valid points in the current
+        # batch. A previous version used a fixed [-2, 2]^3 grid in world
+        # meters, but ARKitScenes scenes centered at the point-cloud
+        # centroid routinely span ±5-10 m along X/Y (e.g. the Locate-3D
+        # annotation JSON shows GT box centers as far as ±10 m from origin),
+        # so a fixed ±2 m grid places every anchor well inside a small sub-
+        # region of the scene and leaves most GT boxes unreachable. The
+        # per-sample scaling below makes every query's anchor lie inside the
+        # point-cloud AABB regardless of scene size or centroid offset.
         n_axis = max(2, int(round(num_queries ** (1.0 / 3.0))))
-        axis = torch.linspace(-2.0, 2.0, n_axis)
+        axis = torch.linspace(-1.0, 1.0, n_axis)
         gx, gy, gz = torch.meshgrid(axis, axis, axis, indexing="ij")
         anchors = torch.stack([gx.flatten(), gy.flatten(), gz.flatten()], dim=-1)
         if anchors.shape[0] >= num_queries:
             anchors = anchors[:num_queries]
         else:
-            pad = (torch.rand(num_queries - anchors.shape[0], 3) * 4.0) - 2.0
+            pad = (torch.rand(num_queries - anchors.shape[0], 3) * 2.0) - 1.0
             anchors = torch.cat([anchors, pad], dim=0)
-        self.register_buffer("query_anchor", anchors.contiguous(), persistent=False)
+        self.register_buffer("query_anchor_norm", anchors.contiguous(), persistent=False)
 
         drop_paths = [
             x.item()
@@ -356,7 +376,26 @@ class Locate3DDecoder(nn.Module):
         # embedding (same MLP that encodes point xyz). This gives each query
         # a distinct spatial bias from epoch 0, so cross-attention naturally
         # focuses on a different scene region per query.
-        anchor = self.query_anchor.unsqueeze(0).expand(B, -1, -1)  # (B, Q, 3)
+        #
+        # Anchors are placed inside the AABB of the valid (non-padded) points
+        # for each sample in the batch. The stored anchor_norm is a uniform
+        # [-1, 1]^3 grid; we map it affinely to [scene_min, scene_max] per
+        # sample so that no matter how large or off-center the scene is, the
+        # query grid still covers it. A 0.5 m floor on the half-extent avoids
+        # a degenerate zero-volume anchor grid on pathologically thin
+        # batches.
+        xyz_f = ptc_xyz.float()
+        valid_mask = (~ptc_key_padding_mask).unsqueeze(-1).expand_as(xyz_f)
+        big = xyz_f.new_tensor(1e6)
+        masked_for_min = torch.where(valid_mask, xyz_f, big)
+        masked_for_max = torch.where(valid_mask, xyz_f, -big)
+        scene_min = masked_for_min.amin(dim=1)                      # (B, 3)
+        scene_max = masked_for_max.amax(dim=1)                      # (B, 3)
+        scene_center = 0.5 * (scene_min + scene_max)
+        scene_half = (0.5 * (scene_max - scene_min)).clamp_min(0.5)
+        anchor_norm = self.query_anchor_norm.unsqueeze(0).expand(B, -1, -1)
+        anchor = anchor_norm * scene_half.unsqueeze(1) + scene_center.unsqueeze(1)
+        anchor = anchor.to(ptc_xyz.dtype)                           # (B, Q, 3)
         anchor_pos = self.pos_embed_3d(anchor)                      # (B, Q, d_model)
         query_pos = self.query_pos.weight.unsqueeze(0).repeat(B, 1, 1) + anchor_pos
 
