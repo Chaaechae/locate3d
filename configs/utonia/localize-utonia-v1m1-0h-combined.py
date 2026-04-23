@@ -320,3 +320,22 @@ hooks = [
     dict(type="Locate3DMetricsLogger", log_train_every=1),
     dict(type="CheckpointSaver", save_freq=None),
 ]
+
+
+# --- cleanup private helpers / intermediate collections --------------------
+# Pointcept's ``Config.dump()`` writes EVERY top-level name that does not
+# start with a double underscore into the dumped config.py -- then runs
+# yapf on the result to pretty-print it. Python function objects get
+# stringified to ``<function _maybe at 0x...>`` which is not valid Python
+# syntax, so yapf's FormatCode raises yapf_api.YapfAPIError on files that
+# happen to leak a helper function (only this config does).
+#
+# Explicitly ``del`` the helpers + intermediate lists after ``data`` /
+# ``hooks`` are built. The ``data`` dict still references the transform
+# lists via object identity, so deleting the variable names doesn't
+# affect runtime behavior -- it only prevents them from appearing in the
+# dumped cfg text.
+del _maybe, _train_datasets, _val_datasets
+del _common_keys, _arkit_aug, _scannet_aug
+del train_transform_arkit, train_transform_scannet
+del val_transform_arkit, val_transform_scannet
