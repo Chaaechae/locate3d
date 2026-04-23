@@ -1,0 +1,66 @@
+[
+  {
+    "object_id": 48,
+    "object_name": "shelf",
+    "ann_id": 0,
+    "description": "white moving trolley is in between of white door and grey sofa ",
+    "token": [
+      "white",
+      "moving",
+      "trolley",
+      "is",
+      "in",
+      "between",
+      "of",
+      "white",
+      "door",
+      "and",
+      "grey",
+      "sofa",
+      ""
+    ],
+    "entities": [
+      [
+        [
+          0,
+          1,
+          2
+        ],
+        [
+          "48_shelf"
+        ]
+      ],
+      [
+        [
+          10,
+          11
+        ],
+        [
+          "5_sofa"
+        ]
+      ],
+      [
+        [
+          7,
+          8
+        ],
+        [
+          "1_door"
+        ]
+      ]
+    ],
+    "primary_key": "1102644611063036",
+    "scene_id": "5656608266",
+    "frames_used": [
+      5280,
+      5310,
+      5340,
+      5370,
+      5400,
+      5430,
+      5460,
+      5490
+    ],
+    "scene_dataset": "ScanNet++"
+  }
+]
