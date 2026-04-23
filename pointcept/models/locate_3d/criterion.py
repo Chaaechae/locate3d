@@ -154,7 +154,22 @@ class Locate3DCriterion(nn.Module):
     def forward(self, outputs, targets):
         device = outputs["pred_logits"].device
         num_boxes = sum(len(t["boxes_xyzxyz"]) for t in targets)
-        num_boxes = max(num_boxes, 1)
+        num_boxes_t = torch.as_tensor(
+            [num_boxes], dtype=torch.float32, device=device
+        )
+        # DETR / MDETR convention: divide per-sample sum-losses by the
+        # world-averaged number of GT boxes, so that the loss magnitude on a
+        # GPU with few GTs matches a GPU with many GTs. Without this, ranks
+        # with more entities in the batch contribute smaller per-loss values
+        # (sum/num_boxes is larger locally) and DDP all-reduce of gradients
+        # systematically underweights those samples -- which is exactly the
+        # regime where multi-entity supervision matters most.
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(num_boxes_t)
+            world_size = torch.distributed.get_world_size()
+        else:
+            world_size = 1
+        num_boxes = torch.clamp(num_boxes_t / world_size, min=1.0).item()
 
         indices = self.matcher(outputs, targets)
         losses = self._single_layer_loss(outputs, targets, indices, num_boxes)
