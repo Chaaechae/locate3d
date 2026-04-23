@@ -34,7 +34,7 @@ Use the same CLI as 0a, e.g.::
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 16  # total bs across all gpus
+batch_size = 4  # total bs across all gpus
 num_worker = 16
 mix_prob = 0.0
 # clip_grad is intentionally loose. Locate-3D's decoder shares one BBoxHead
@@ -58,7 +58,7 @@ enable_wandb = False
 train = dict(type="Locate3DTrainer")
 
 # dataset paths
-arkit_root = "/group-volume/arkitscenes-compressed"
+arkit_root = "/group-volume/3Ddataset/arkitscenes-compressed"
 train_annotation = "locate-3d/locate3d_data/train_arkitscenes.json"
 val_annotation = "locate-3d/locate3d_data/val_arkitscenes.json"
 

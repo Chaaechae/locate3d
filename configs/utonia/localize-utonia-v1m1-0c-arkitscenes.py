@@ -42,7 +42,7 @@ Identical CLI to 0a/0b::
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 16
+batch_size = 4
 num_worker = 16
 mix_prob = 0.0
 clip_grad = 10.0
@@ -56,7 +56,7 @@ enable_wandb = False
 
 train = dict(type="Locate3DTrainer")
 
-arkit_root = "/group-volume/arkitscenes-compressed"
+arkit_root = "/group-volume/3Ddataset/arkitscenes-compressed"
 train_annotation = "locate-3d/locate3d_data/train_arkitscenes.json"
 val_annotation = "locate-3d/locate3d_data/val_arkitscenes.json"
 
