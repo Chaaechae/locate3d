@@ -35,8 +35,15 @@ arkit_root = "/group-volume/arkitscenes-compressed"
 train_annotation = "locate-3d/locate3d_data/train_arkitscenes.json"
 val_annotation = "locate-3d/locate3d_data/val_arkitscenes.json"
 
-# path to a Utonia pretrain checkpoint (fill in when available)
+# path to a Utonia pretrain checkpoint (fill in when available).
+# Pointcept's CheckpointLoader reads from ``cfg.weight``; wire it through
+# so that setting ``utonia_pretrained_path`` automatically loads the ckpt.
+# Without a pretrained encoder the decoder cannot learn box regression
+# (text alignment still converges, but geometry does not), so leaving
+# this None means the backbone trains from random init -- expect very
+# slow / no convergence of loss_bbox / loss_giou in that regime.
 utonia_pretrained_path = None
+weight = utonia_pretrained_path
 
 # decoder configuration
 decoder_cfg = dict(
