@@ -34,8 +34,8 @@ Use the same CLI as 0a, e.g.::
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 4  # total bs across all gpus
-num_worker = 16
+batch_size = 16  # total bs across all gpus (per-GPU = batch_size // world_size)
+num_worker = 32
 mix_prob = 0.0
 # clip_grad is intentionally loose. Locate-3D's decoder shares one BBoxHead
 # across all 9 supervised layers (final + 8 aux), so the gradient summed at

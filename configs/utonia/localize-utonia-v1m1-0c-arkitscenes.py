@@ -42,8 +42,8 @@ Identical CLI to 0a/0b::
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 4
-num_worker = 16
+batch_size = 16
+num_worker = 32
 mix_prob = 0.0
 clip_grad = 10.0
 empty_cache = False
