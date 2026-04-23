@@ -256,6 +256,26 @@ class Locate3DDecoder(nn.Module):
         self.query_feat = nn.Embedding(num_queries, d_model)
         self.query_pos = nn.Embedding(num_queries, d_model)
 
+        # Spatial anchors so different queries are biased to different scene
+        # regions from the very first forward. Without this, every query's
+        # bbox starts at center≈0 (linear init) and the Hungarian matcher
+        # cannot distinguish queries by geometry, so class cost dominates and
+        # the matched query set collapses to the few that happen to win the
+        # text-alignment race -- starving the rest of the bbox head from any
+        # gradient. The bbox head learns an offset from each anchor.
+        # Anchors live in the same (centered) coord frame as ptc_xyz / GT
+        # boxes; range [-2, 2] m covers typical centered ARKitScenes scenes.
+        n_axis = max(2, int(round(num_queries ** (1.0 / 3.0))))
+        axis = torch.linspace(-2.0, 2.0, n_axis)
+        gx, gy, gz = torch.meshgrid(axis, axis, axis, indexing="ij")
+        anchors = torch.stack([gx.flatten(), gy.flatten(), gz.flatten()], dim=-1)
+        if anchors.shape[0] >= num_queries:
+            anchors = anchors[:num_queries]
+        else:
+            pad = (torch.rand(num_queries - anchors.shape[0], 3) * 4.0) - 2.0
+            anchors = torch.cat([anchors, pad], dim=0)
+        self.register_buffer("query_anchor", anchors.contiguous(), persistent=False)
+
         drop_paths = [
             x.item()
             for x in torch.linspace(0, transformer_max_drop_path, num_decoder_layers)
@@ -332,7 +352,13 @@ class Locate3DDecoder(nn.Module):
         query_mask = torch.cat([query_false, text_pad_mask], dim=1)
 
         query_feats = self.query_feat.weight.unsqueeze(0).repeat(B, 1, 1)
-        query_pos = self.query_pos.weight.unsqueeze(0).repeat(B, 1, 1)
+        # Per-query positional embedding = learned embedding + spatial-anchor
+        # embedding (same MLP that encodes point xyz). This gives each query
+        # a distinct spatial bias from epoch 0, so cross-attention naturally
+        # focuses on a different scene region per query.
+        anchor = self.query_anchor.unsqueeze(0).expand(B, -1, -1)  # (B, Q, 3)
+        anchor_pos = self.pos_embed_3d(anchor)                      # (B, Q, d_model)
+        query_pos = self.query_pos.weight.unsqueeze(0).repeat(B, 1, 1) + anchor_pos
 
         predictions_class = []
         predictions_mask = []
@@ -353,6 +379,10 @@ class Locate3DDecoder(nn.Module):
             mask = self.mask_prediction_heads[i](query_feats, ptc_feats)
             text_alignment = self.text_alignment_head[i](query_feats)
             bbox = self.bbox_head(query_feats, ptc_feats, ptc_xyz, ptc_mask=ptc_key_padding_mask)
+            # bbox is (B, Q, 6) = (cx, cy, cz, w, h, d). Treat the regressed
+            # center as an offset from the per-query anchor so different
+            # queries start with boxes in different scene regions.
+            bbox = torch.cat([bbox[..., :3] + anchor, bbox[..., 3:]], dim=-1)
             bbox = box_cxcyczwhd_to_xyzxyz_jit(bbox)
 
             predictions_class.append(text_alignment)
