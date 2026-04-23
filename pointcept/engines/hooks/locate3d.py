@@ -496,16 +496,19 @@ class Locate3DStartupSanity(HookBase):
                         kw = getattr(h, "keywords", "")
                         rep = getattr(h, "replacement", "")
                         break
-                remapped = []
-                for k in ckpt_keys_raw:
-                    k2 = k if k.startswith("module.") else "module." + k
-                    if kw and kw in k2:
-                        k2 = k2.replace(kw, rep, 1)
-                    # canonical form: always drop the "module." prefix so the
-                    # comparison is against UNWRAPPED model keys
-                    if k2.startswith("module."):
-                        k2 = k2[len("module."):]
-                    remapped.append(k2)
+
+                def _remap(raw_keys, keyword, replacement):
+                    out = []
+                    for k in raw_keys:
+                        k2 = k if k.startswith("module.") else "module." + k
+                        if keyword and keyword in k2:
+                            k2 = k2.replace(keyword, replacement, 1)
+                        if k2.startswith("module."):
+                            k2 = k2[len("module."):]
+                        out.append(k2)
+                    return out
+
+                remapped = _remap(ckpt_keys_raw, kw, rep)
 
                 # Target: model's backbone state_dict keys (unwrapped model).
                 model_state_keys = list(model.state_dict().keys())
@@ -532,12 +535,46 @@ class Locate3DStartupSanity(HookBase):
                 if len(loaded) == 0:
                     logger.warning(
                         "[Locate3D sanity] ZERO backbone keys matched the "
-                        "checkpoint. The Utonia pretrain did not load. "
-                        "Diagnose: examples of ckpt keys (first 5): {} ; "
-                        "model.backbone keys (first 5): {}".format(
-                            ckpt_keys_raw[:5], backbone_keys[:5]
-                        )
+                        "checkpoint with keywords={!r} -> {!r}. The Utonia "
+                        "pretrain did not load.".format(kw, rep)
                     )
+                    logger.warning(
+                        "[Locate3D sanity] examples of ckpt keys (first 5): "
+                        "{}".format(ckpt_keys_raw[:5])
+                    )
+                    logger.warning(
+                        "[Locate3D sanity] examples of model.backbone keys "
+                        "(first 5): {}".format(backbone_keys[:5])
+                    )
+                    # Try common alternative rewrites and suggest the best one.
+                    candidates = [
+                        ("module.student.backbone", "module.backbone"),
+                        ("module.", "module.backbone."),
+                        ("student.backbone.", "backbone."),
+                        ("student.", "backbone."),
+                        ("", "backbone."),
+                    ]
+                    best = None
+                    for ck, cr in candidates:
+                        cand_set = set(_remap(ckpt_keys_raw, ck, cr))
+                        cand_loaded = sum(1 for k in backbone_keys if k in cand_set)
+                        if cand_loaded > 0 and (best is None or cand_loaded > best[2]):
+                            best = (ck, cr, cand_loaded)
+                    if best is not None:
+                        logger.warning(
+                            "[Locate3D sanity] -> SUGGESTED FIX: switch "
+                            "CheckpointLoader to keywords={!r} -> "
+                            "replacement={!r} (would load {} / {} "
+                            "backbone keys).".format(
+                                best[0], best[1], best[2], len(backbone_keys)
+                            )
+                        )
+                    else:
+                        logger.warning(
+                            "[Locate3D sanity] no common rewrite candidate "
+                            "recovered any keys. Inspect the ckpt manually "
+                            "with tools/inspect_utonia_ckpt.py."
+                        )
                 elif len(missing) > 0:
                     logger.info(
                         "[Locate3D sanity] example missing backbone keys "

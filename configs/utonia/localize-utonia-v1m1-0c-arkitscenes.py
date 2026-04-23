@@ -234,8 +234,8 @@ data = dict(
 hooks = [
     dict(
         type="CheckpointLoader",
-        keywords="module.",
-        replacement="module.backbone.",
+        keywords="module.student.backbone",
+        replacement="module.backbone",
     ),
     dict(type="Locate3DStartupSanity"),
     dict(type="IterationTimer", warmup_iter=2),
