@@ -429,30 +429,23 @@ class Locate3DDebugPrinter(HookBase):
 
 @HOOKS.register_module()
 class Locate3DStartupSanity(HookBase):
-    """Runs once, before training starts, to surface common silent failures:
+    """Runs once, before training starts, to surface common silent failures.
 
-    - Backbone parameter coverage: how many params in the backbone got loaded
-      from the checkpoint vs left at random init. If Utonia's pretrained
-      encoder dropped ("Missing keys" in CheckpointLoader log covered
-      everything important), this will scream.
-    - Point-cloud encoding shape on a real batch: prints the (N_points,
-      feat_dim) of the tensor reaching the Locate-3D decoder. For 0c/0e/0g
-      you want feat_dim==576 (or 432 for 0g) and N_points in the 100s-1000s;
-      for 0d you want feat_dim==54 and N_points ~ tens of thousands.
-    - BBoxHead final-Linear weight norm. If it is still ~0 after an epoch,
-      gradients are not flowing -- check clip_grad / loss weights.
+    Main check: re-load the Utonia checkpoint from ``cfg.weight`` and compute
+    the EXACT overlap between checkpoint keys (after the CheckpointLoader
+    rewrite ``module.student.backbone`` -> ``module.backbone``) and our
+    ``model.backbone.*`` keys. This is a definitive "was the pretrained
+    encoder actually loaded?" signal -- no magnitude heuristics, no guessing.
 
-    Register this BEFORE the iteration timer so it runs early; outputs a
-    single INFO line block per rank-0.
+    Also reports the BBoxHead final-Linear weight / bias norm at startup (for
+    Locate3DLocalizer) and after each epoch, so the user can see whether the
+    bbox regression head is actually moving.
     """
 
-    def __init__(self, sample_index=0):
-        self.sample_index = int(sample_index)
-        self._dumped_startup = False
+    def __init__(self):
         self._epoch_marker = -1
 
     def _find_backbone(self):
-        # Unwrap DDP
         m = self.trainer.model
         if hasattr(m, "module"):
             m = m.module
@@ -462,52 +455,93 @@ class Locate3DStartupSanity(HookBase):
         if not comm.is_main_process():
             return
         backbone, decoder, model = self._find_backbone()
-        if backbone is None:
-            self.trainer.logger.info(
-                "[Locate3D sanity] model has no 'backbone' attribute; skip"
+        logger = self.trainer.logger
+
+        # ---- Checkpoint coverage check ----
+        wpath = getattr(self.trainer.cfg, "weight", None)
+        if not wpath or not os.path.isfile(wpath):
+            logger.warning(
+                "[Locate3D sanity] cfg.weight={!r}: file not found. "
+                "Every backbone weight is at RANDOM INIT. "
+                "This almost certainly explains any 'dbg_match_iou stuck near 0' "
+                "symptom -- no Utonia pretrain actually loaded.".format(wpath)
             )
-            return
+        elif backbone is not None:
+            try:
+                ckpt = torch.load(wpath, map_location="cpu", weights_only=False)
+                if isinstance(ckpt, dict) and "state_dict" in ckpt:
+                    ckpt_sd = ckpt["state_dict"]
+                else:
+                    ckpt_sd = ckpt
+                ckpt_keys_raw = list(ckpt_sd.keys())
 
-        # Parameter coverage: crude heuristic -- report fraction of backbone
-        # params whose absolute mean is below a small threshold (likely
-        # still at init). NOT a perfect signal but pairs well with the
-        # CheckpointLoader 'Missing keys:' log.
-        total = trained_like = random_like = 0
-        for n, p in backbone.named_parameters():
-            total += 1
-            m = p.detach().float().abs().mean().item()
-            # Kaiming / trunc_normal init usually has mean |x| ~ 0.01-0.05;
-            # pretrained weights generally have larger abs mean. This is
-            # loose but surfaces the "everything is pristine random init"
-            # failure mode.
-            if m > 0.08:
-                trained_like += 1
-            else:
-                random_like += 1
+                # Replicate the CheckpointLoader remap logic.
+                ws = comm.get_world_size()
+                kw = "module.student.backbone"
+                rep = "module.backbone"
+                remapped = []
+                for k in ckpt_keys_raw:
+                    k2 = k if k.startswith("module.") else "module." + k
+                    if kw in k2:
+                        k2 = k2.replace(kw, rep, 1)
+                    if ws == 1:
+                        k2 = k2[7:]  # drop "module."
+                    remapped.append(k2)
 
-        self.trainer.logger.info(
-            "[Locate3D sanity] backbone params: {} total; "
-            "{} look pretrained-like, {} look random-like "
-            "(heuristic on |w|.mean()).".format(total, trained_like, random_like)
-        )
+                # Target: model's backbone state_dict keys, stripped to
+                # match the rewrite convention.
+                model_state_keys = list(model.state_dict().keys())
+                backbone_keys = [
+                    k for k in model_state_keys if k.startswith("backbone.")
+                ]
 
-        # BBoxHead final-linear weight norm
+                ckpt_set = set(remapped)
+                loaded = [k for k in backbone_keys if k in ckpt_set]
+                missing = [k for k in backbone_keys if k not in ckpt_set]
+
+                logger.info(
+                    "[Locate3D sanity] ckpt file has {} keys; "
+                    "model.backbone has {} keys; "
+                    "EXACT OVERLAP after rewrite: {} loaded, {} missing.".format(
+                        len(ckpt_keys_raw), len(backbone_keys),
+                        len(loaded), len(missing)
+                    )
+                )
+                if len(loaded) == 0:
+                    logger.warning(
+                        "[Locate3D sanity] ZERO backbone keys matched the "
+                        "checkpoint. The Utonia pretrain did not load. "
+                        "Diagnose: examples of ckpt keys (first 5): {} ; "
+                        "model.backbone keys (first 5): {}".format(
+                            ckpt_keys_raw[:5], backbone_keys[:5]
+                        )
+                    )
+                elif len(missing) > 0:
+                    logger.info(
+                        "[Locate3D sanity] example missing backbone keys "
+                        "(first 10): {}".format(missing[:10])
+                    )
+            except (OSError, RuntimeError, KeyError) as e:
+                logger.warning(
+                    "[Locate3D sanity] could not inspect ckpt: {}".format(e)
+                )
+
+        # ---- BBoxHead final-linear weight/bias norm ----
         if decoder is not None and hasattr(decoder, "bbox_head"):
             try:
                 final_lin = decoder.bbox_head.bbox_predictor[-1]
                 wn = final_lin.weight.detach().float().norm().item()
                 bn = final_lin.bias.detach().float().norm().item()
-                self.trainer.logger.info(
-                    f"[Locate3D sanity] bbox_head final linear weight norm "
-                    f"= {wn:.4f}, bias norm = {bn:.4f} "
-                    f"(expected ~0 at init; grow >0.1 once learning starts)"
+                logger.info(
+                    "[Locate3D sanity] bbox_head final linear weight norm "
+                    "= {:.4f}, bias norm = {:.4f} "
+                    "(=0 by design at init; should grow >0.1 within 1-2 "
+                    "epochs once gradient flows).".format(wn, bn)
                 )
             except (AttributeError, IndexError, TypeError):
                 pass
 
     def after_epoch(self):
-        # Re-check the bbox head once per epoch so the user sees whether its
-        # weights are actually moving.
         if not comm.is_main_process():
             return
         if self.trainer.epoch == self._epoch_marker:
