@@ -72,18 +72,13 @@ from pointcept.datasets.transform import Compose
 
 
 # Plotly qualitative palette (D3 "Category10"-ish)
-# Entity palette for GROUND-TRUTH boxes (D3 Category10, muted/pro).
-_GT_PALETTE = [
-    "#1f77b4", "#2ca02c", "#9467bd", "#8c564b", "#7f7f7f",
-    "#17becf", "#bcbd22", "#e377c2", "#aec7e8", "#98df8a",
-]
-
-# Entity palette for PREDICTED boxes -- deliberately vivid, neon-
-# saturated colors that stand out against an RGB point cloud so the
-# predicted entity is instantly visible. Indexed parallel to _GT_PALETTE
-# so GT and Pred for the same entity are not identical but still
-# visually related (warm-vs-cool pairs).
-_PRED_PALETTE = [
+# Two entity-indexed palettes. ``_VIVID_PALETTE`` is the high-visibility
+# neon set used for whichever box (GT or Pred) should be the dominant
+# visual element; ``_MUTED_PALETTE`` is the softer D3 Category10 set for
+# the secondary box. Current assignment: GT = vivid, Pred = muted --
+# users are comparing "did the pred land on the GT?", so the target GT
+# box needs to pop off the RGB point cloud first.
+_VIVID_PALETTE = [
     "#ff00ff",  # magenta
     "#00ff00",  # lime
     "#ffff00",  # yellow
@@ -94,6 +89,10 @@ _PRED_PALETTE = [
     "#ff8c00",  # dark orange
     "#7fff00",  # chartreuse
     "#ff69b4",  # hot pink
+]
+_MUTED_PALETTE = [
+    "#1f77b4", "#2ca02c", "#9467bd", "#8c564b", "#7f7f7f",
+    "#17becf", "#bcbd22", "#e377c2", "#aec7e8", "#98df8a",
 ]
 
 
@@ -360,8 +359,14 @@ def _render_scene(
 
     G = max(len(gt_boxes), len(pred_boxes))
     for g in range(G):
-        gt_color = _GT_PALETTE[g % len(_GT_PALETTE)]
-        pred_color = _PRED_PALETTE[g % len(_PRED_PALETTE)]
+        # GT gets the vivid neon palette + solid thick lines + corner
+        # markers so the target box pops off the RGB point cloud and is
+        # impossible to miss.
+        # Pred gets the muted D3 palette with a slightly thinner line,
+        # so the reader can still compare it to GT without it being the
+        # dominant visual element.
+        gt_color = _VIVID_PALETTE[g % len(_VIVID_PALETTE)]
+        pred_color = _MUTED_PALETTE[g % len(_MUTED_PALETTE)]
         if entity_names is not None and g < len(entity_names):
             name = entity_names[g]
         else:
@@ -374,7 +379,9 @@ def _render_scene(
         is_primary = g == primary_idx
         suffix = " (primary)" if is_primary else ""
 
-        # GT box: dashed, muted color, thinner.
+        # GT box: vivid neon, SOLID, thick line + diamond corner markers.
+        # Highest visual priority; this is what the user is trying to
+        # hit, so it must be clearly locatable against any background.
         if g < len(gt_boxes):
             xs, ys, zs = _box_edges(gt_boxes[g])
             fig.add_trace(
@@ -382,16 +389,31 @@ def _render_scene(
                     x=xs, y=ys, z=zs, mode="lines",
                     line=dict(
                         color=gt_color,
-                        width=4 if is_primary else 3,
-                        dash="dash",
+                        width=10 if is_primary else 8,
                     ),
                     name=f"GT: {name}{toks}{suffix}",
                     legendgroup=f"e{g}",
                 )
             )
-        # Predicted box: vivid neon color, SOLID, thick line, corner
-        # markers. Visually pops off the RGB point cloud and is impossible
-        # to miss even when GT is nearby.
+            cx, cy, cz = _box_corners(gt_boxes[g])
+            fig.add_trace(
+                go.Scatter3d(
+                    x=cx, y=cy, z=cz, mode="markers",
+                    marker=dict(
+                        size=6 if is_primary else 4,
+                        color=gt_color,
+                        symbol="diamond",
+                        line=dict(color="black", width=1),
+                    ),
+                    name=f"GT corners {name}",
+                    legendgroup=f"e{g}",
+                    showlegend=False,
+                    hoverinfo="skip",
+                )
+            )
+        # Predicted box: muted palette, SOLID (dashed blends into point
+        # cloud), medium-thin line. Easy to compare against GT without
+        # stealing focus.
         if g < len(pred_boxes):
             xs, ys, zs = _box_edges(pred_boxes[g])
             fig.add_trace(
@@ -399,26 +421,10 @@ def _render_scene(
                     x=xs, y=ys, z=zs, mode="lines",
                     line=dict(
                         color=pred_color,
-                        width=10 if is_primary else 8,
+                        width=5 if is_primary else 4,
                     ),
                     name=f"Pred: {name}{toks}{suffix}",
                     legendgroup=f"e{g}",
-                )
-            )
-            cx, cy, cz = _box_corners(pred_boxes[g])
-            fig.add_trace(
-                go.Scatter3d(
-                    x=cx, y=cy, z=cz, mode="markers",
-                    marker=dict(
-                        size=6 if is_primary else 4,
-                        color=pred_color,
-                        symbol="diamond",
-                        line=dict(color="black", width=1),
-                    ),
-                    name=f"Pred corners {name}",
-                    legendgroup=f"e{g}",
-                    showlegend=False,
-                    hoverinfo="skip",
                 )
             )
 
@@ -527,9 +533,10 @@ def _resolve_entity_meta(ann, num_boxes, primary_idx):
         Ordered list of caption words each entity was derived from.
     caption_token_colormap : list[str | None]
         One entry per word in ``ann["description"].split(" ")``: the hex
-        color (from ``_PRED_PALETTE``) of whichever entity claims that
-        word, or None if no entity claims it. Used by ``_render_scene``
-        to color-highlight the caption HTML title.
+        vivid color of whichever entity claims that word, or None if no
+        entity claims it. Used by ``_render_scene`` to color-highlight
+        the caption HTML title so the caption word color matches the
+        vivid GT box color in 3D.
     """
     token_words = ann.get("token", [])
     entities = ann.get("entities", [])
@@ -591,7 +598,7 @@ def _resolve_entity_meta(ann, num_boxes, primary_idx):
     # from this word list so index alignment is exact.
     colormap = [None] * len(token_words)
     for slot, oid in enumerate(oids):
-        color = _PRED_PALETTE[slot % len(_PRED_PALETTE)]
+        color = _VIVID_PALETTE[slot % len(_VIVID_PALETTE)]
         for ti in tokens_per_oid.get(oid, set()):
             if 0 <= ti < len(colormap):
                 colormap[ti] = color
