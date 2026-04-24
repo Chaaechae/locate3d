@@ -72,9 +72,28 @@ from pointcept.datasets.transform import Compose
 
 
 # Plotly qualitative palette (D3 "Category10"-ish)
-_PALETTE = [
-    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
-    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+# Entity palette for GROUND-TRUTH boxes (D3 Category10, muted/pro).
+_GT_PALETTE = [
+    "#1f77b4", "#2ca02c", "#9467bd", "#8c564b", "#7f7f7f",
+    "#17becf", "#bcbd22", "#e377c2", "#aec7e8", "#98df8a",
+]
+
+# Entity palette for PREDICTED boxes -- deliberately vivid, neon-
+# saturated colors that stand out against an RGB point cloud so the
+# predicted entity is instantly visible. Indexed parallel to _GT_PALETTE
+# so GT and Pred for the same entity are not identical but still
+# visually related (warm-vs-cool pairs).
+_PRED_PALETTE = [
+    "#ff00ff",  # magenta
+    "#00ff00",  # lime
+    "#ffff00",  # yellow
+    "#ff4500",  # orangered
+    "#00ffff",  # cyan
+    "#ff1493",  # deep pink
+    "#adff2f",  # green-yellow
+    "#ff8c00",  # dark orange
+    "#7fff00",  # chartreuse
+    "#ff69b4",  # hot pink
 ]
 
 
@@ -98,9 +117,15 @@ def _box_edges(b):
     return xs, ys, zs
 
 
-def _make_color_str(hex_color):
-    """Plotly line colors accept hex strings directly."""
-    return hex_color
+def _box_corners(b):
+    """Return the 8 corner xyz tuples of an xyzxyz box. Used to place
+    marker dots at the corners of predicted boxes for extra visibility."""
+    x0, y0, z0, x1, y1, z1 = [float(v) for v in b]
+    return (
+        [x0, x1, x1, x0, x0, x1, x1, x0],
+        [y0, y0, y1, y1, y0, y0, y1, y1],
+        [z0, z0, z0, z0, z1, z1, z1, z1],
+    )
 
 
 def _load_checkpoint(model, weight_path):
@@ -282,7 +307,11 @@ def _render_scene(
     out_path, coord, color, gt_boxes, pred_boxes,
     pred_logits=None, infer_threshold=0.5,
     caption="", scene_id="", primary_idx=0,
-    entity_names=None, max_points=60000, draw_masks=True,
+    entity_names=None,
+    entity_tokens=None,         # list[G] of list[str]: words that drove each entity
+    caption_token_colormap=None, # list aligned to caption_word_list of None|color
+    caption_word_list=None,      # list[str]: words indexed by caption_token_colormap
+    max_points=60000, draw_masks=True,
 ):
     try:
         import plotly.graph_objects as go
@@ -331,44 +360,71 @@ def _render_scene(
 
     G = max(len(gt_boxes), len(pred_boxes))
     for g in range(G):
-        ent_color = _PALETTE[g % len(_PALETTE)]
-        name = (
-            entity_names[g]
-            if entity_names is not None and g < len(entity_names)
-            else f"entity_{g}"
-        )
+        gt_color = _GT_PALETTE[g % len(_GT_PALETTE)]
+        pred_color = _PRED_PALETTE[g % len(_PRED_PALETTE)]
+        if entity_names is not None and g < len(entity_names):
+            name = entity_names[g]
+        else:
+            name = f"entity_{g}"
+        toks = ""
+        if entity_tokens is not None and g < len(entity_tokens):
+            toks = "/".join(entity_tokens[g])
+            if toks:
+                toks = f" [← '{toks}']"   # ← 'words'
         is_primary = g == primary_idx
         suffix = " (primary)" if is_primary else ""
 
-        # GT box: dashed
+        # GT box: dashed, muted color, thinner.
         if g < len(gt_boxes):
             xs, ys, zs = _box_edges(gt_boxes[g])
             fig.add_trace(
                 go.Scatter3d(
                     x=xs, y=ys, z=zs, mode="lines",
                     line=dict(
-                        color=ent_color,
-                        width=5 if is_primary else 3,
+                        color=gt_color,
+                        width=4 if is_primary else 3,
                         dash="dash",
                     ),
-                    name=f"GT {name}{suffix}",
+                    name=f"GT: {name}{toks}{suffix}",
+                    legendgroup=f"e{g}",
                 )
             )
-        # Predicted box: solid
+        # Predicted box: vivid neon color, SOLID, thick line, corner
+        # markers. Visually pops off the RGB point cloud and is impossible
+        # to miss even when GT is nearby.
         if g < len(pred_boxes):
             xs, ys, zs = _box_edges(pred_boxes[g])
             fig.add_trace(
                 go.Scatter3d(
                     x=xs, y=ys, z=zs, mode="lines",
                     line=dict(
-                        color=ent_color,
-                        width=7 if is_primary else 5,
+                        color=pred_color,
+                        width=10 if is_primary else 8,
                     ),
-                    name=f"Pred {name}{suffix}",
+                    name=f"Pred: {name}{toks}{suffix}",
+                    legendgroup=f"e{g}",
+                )
+            )
+            cx, cy, cz = _box_corners(pred_boxes[g])
+            fig.add_trace(
+                go.Scatter3d(
+                    x=cx, y=cy, z=cz, mode="markers",
+                    marker=dict(
+                        size=6 if is_primary else 4,
+                        color=pred_color,
+                        symbol="diamond",
+                        line=dict(color="black", width=1),
+                    ),
+                    name=f"Pred corners {name}",
+                    legendgroup=f"e{g}",
+                    showlegend=False,
+                    hoverinfo="skip",
                 )
             )
 
-        # Mask overlay: points exceeding threshold for this entity
+        # Mask overlay: points exceeding threshold for this entity.
+        # Colored with the VIVID pred palette so "mask" + "pred box" read
+        # as the same visual group.
         if draw_masks and logit_sub is not None and g < logit_sub.shape[0]:
             prob_g = 1.0 / (1.0 + np.exp(-logit_sub[g]))  # sigmoid
             mask_g = prob_g > infer_threshold
@@ -380,7 +436,7 @@ def _render_scene(
                         mode="markers",
                         marker=dict(
                             size=3 if is_primary else 2,
-                            color=ent_color,
+                            color=pred_color,
                             opacity=0.9,
                         ),
                         name=f"Mask {name}{suffix}",
@@ -388,7 +444,31 @@ def _render_scene(
                     )
                 )
 
-    title = f"<b>{scene_id}</b><br><sub>{caption}</sub>"
+    # Caption rendering: prefer the annotation's ``token`` word list (the
+    # same words that ``entities`` token indices refer to). Fall back to
+    # whitespace-splitting the raw caption if no word list was provided.
+    # Each entity's token words get highlighted in that entity's vivid
+    # pred-palette color so the reader can see at a glance "which word
+    # in the caption corresponds to which predicted box".
+    colored_caption = caption
+    if caption_token_colormap is not None:
+        words = caption_word_list if caption_word_list is not None else caption.split(" ")
+        rendered = []
+        for wi, w in enumerate(words):
+            if not w:
+                continue
+            color = None
+            if wi < len(caption_token_colormap):
+                color = caption_token_colormap[wi]
+            if color is not None:
+                rendered.append(
+                    f"<span style='color:{color};font-weight:bold'>{w}</span>"
+                )
+            else:
+                rendered.append(w)
+        colored_caption = " ".join(rendered)
+
+    title = f"<b>{scene_id}</b><br><sub>{colored_caption}</sub>"
     fig.update_layout(
         title=title,
         scene=dict(
@@ -396,8 +476,8 @@ def _render_scene(
             xaxis_title="x", yaxis_title="y", zaxis_title="z",
         ),
         height=850,
-        margin=dict(l=0, r=0, t=60, b=0),
-        legend=dict(itemsizing="constant"),
+        margin=dict(l=0, r=0, t=80, b=0),
+        legend=dict(itemsizing="constant", groupclick="toggleitem"),
     )
     fig.write_html(out_path)
     print(f"[wrote] {out_path}")
@@ -411,6 +491,111 @@ def _sample_to_gpu(batch):
         else:
             gpu[k] = v
     return gpu
+
+
+def _resolve_entity_meta(ann, num_boxes, primary_idx):
+    """Figure out which caption tokens (words) correspond to each entity
+    slot in the model output, and return (names, tokens, colormap).
+
+    The Locate-3D annotation schema stores entities as
+    ``[[token_indices, ["{oid}_label"]], ...]`` where ``token_indices``
+    are whitespace-word indices into ``ann["token"]``.
+
+    Both ARKitScenes and ScanNet / ScanNet++ adapters re-order entities
+    so the PRIMARY object_id (``ann["object_id"]``) occupies slot 0;
+    any remaining oids follow in first-seen order. We replicate that
+    ordering here so the per-entity outputs from the model line up 1-1
+    with ``entity_names[g]`` / ``entity_tokens[g]``.
+
+    Parameters
+    ----------
+    ann : dict
+        The raw annotation row from the dataset's ``anns`` list.
+    num_boxes : int
+        max(len(gt_boxes), len(pred_boxes)) -- output arrays are padded
+        to this length with placeholder labels for any missing entities.
+    primary_idx : int
+        Index within the ordered oid list that holds the primary. Matches
+        what the dataset's ``primary_object_id`` field means.
+
+    Returns
+    -------
+    entity_names : list[str]
+        Human-readable name per entity slot (uses ``ann["object_name"]``
+        for the primary when available, otherwise the joined word tokens).
+    entity_tokens : list[list[str]]
+        Ordered list of caption words each entity was derived from.
+    caption_token_colormap : list[str | None]
+        One entry per word in ``ann["description"].split(" ")``: the hex
+        color (from ``_PRED_PALETTE``) of whichever entity claims that
+        word, or None if no entity claims it. Used by ``_render_scene``
+        to color-highlight the caption HTML title.
+    """
+    token_words = ann.get("token", [])
+    entities = ann.get("entities", [])
+    description = ann.get("description", "")
+
+    # 1) union of oids in the same order used by the adapters.
+    oids = []
+    for _, labels in entities:
+        for lab in labels:
+            try:
+                oid = int(str(lab).split("_")[0])
+            except ValueError:
+                continue
+            if oid not in oids:
+                oids.append(oid)
+    primary_oid = int(ann.get("object_id", oids[0] if oids else 0))
+    if primary_oid in oids:
+        oids.remove(primary_oid)
+    oids = [primary_oid] + oids
+    if len(oids) == 0:
+        oids = [0]
+
+    # 2) word-index sets per oid.
+    tokens_per_oid = {oid: set() for oid in oids}
+    for token_idx_list, labels in entities:
+        for lab in labels:
+            try:
+                oid = int(str(lab).split("_")[0])
+            except ValueError:
+                continue
+            if oid not in tokens_per_oid:
+                continue
+            for ti in token_idx_list:
+                if 0 <= int(ti) < len(token_words):
+                    tokens_per_oid[oid].add(int(ti))
+
+    entity_names = []
+    entity_tokens = []
+    primary_name = ann.get("object_name", "") or ""
+    for slot in range(num_boxes):
+        if slot < len(oids):
+            oid = oids[slot]
+            words = [token_words[i] for i in sorted(tokens_per_oid.get(oid, set()))]
+            entity_tokens.append(words)
+            if slot == primary_idx and primary_name:
+                entity_names.append(str(primary_name))
+            elif len(words) > 0:
+                entity_names.append(" ".join(words))
+            else:
+                entity_names.append(f"entity_{slot}")
+        else:
+            entity_names.append(f"entity_{slot}")
+            entity_tokens.append([])
+
+    # 3) per-word color assignment. We index by the annotation's
+    # ``token`` word list (which the entities' indices refer to) --
+    # NOT by ``description.split(" ")`` which can differ in
+    # whitespace/punctuation. The render side rebuilds the caption
+    # from this word list so index alignment is exact.
+    colormap = [None] * len(token_words)
+    for slot, oid in enumerate(oids):
+        color = _PRED_PALETTE[slot % len(_PRED_PALETTE)]
+        for ti in tokens_per_oid.get(oid, set()):
+            if 0 <= ti < len(colormap):
+                colormap[ti] = color
+    return entity_names, entity_tokens, colormap, token_words
 
 
 def main():
@@ -520,12 +705,18 @@ def main():
         color = _get_color_from_feat(batch["feat"])
 
         ann = dataset.anns[ds_idx]
-        entity_name_field = ann.get("object_name", "")
-        # Give at least the primary entity a human-readable name.
         G = max(gt_boxes.shape[0], pred_boxes.shape[0])
-        entity_names = [f"entity_{i}" for i in range(G)]
-        if entity_name_field and primary < len(entity_names):
-            entity_names[primary] = str(entity_name_field)
+
+        # Resolve:
+        #   entity_names[g]  = human-readable name per entity
+        #   entity_tokens[g] = list of caption words that drove entity g
+        #   caption_token_colormap[wi] = matched entity color for word wi
+        # so the caption HTML can color-highlight "which word fed which box".
+        entity_names, entity_tokens, cap_colormap, cap_words = _resolve_entity_meta(
+            ann=ann,
+            num_boxes=G,
+            primary_idx=primary,
+        )
 
         out_path = os.path.join(
             args.output_dir,
@@ -543,6 +734,9 @@ def main():
             scene_id=scene_id,
             primary_idx=primary,
             entity_names=entity_names,
+            entity_tokens=entity_tokens,
+            caption_token_colormap=cap_colormap,
+            caption_word_list=cap_words,
             draw_masks=not args.no_mask,
         )
 
