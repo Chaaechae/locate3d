@@ -45,6 +45,15 @@ import copy
 import os
 import sys
 
+# Make the repo-local ``pointcept`` package importable regardless of the
+# user's current working directory. ``tools/visualize_locate3d.py`` lives
+# one level below the repo root, so add the parent directory to sys.path
+# before the first pointcept import. Equivalent to what a user-managed
+# ``pip install -e .`` would achieve but without requiring that setup.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import numpy as np
 import torch
 
