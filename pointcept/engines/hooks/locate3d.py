@@ -169,6 +169,20 @@ class Locate3DVizHook(HookBase):
         return chosen
 
     def after_epoch(self):
+        # Viz is a "nice to have" diagnostic -- any failure here MUST
+        # NOT kill training. Wrap the whole routine in a best-effort
+        # try/except so a flaky filesystem or GPU hiccup during
+        # rendering surfaces as a log warning instead of a crash.
+        try:
+            self._after_epoch_impl()
+        except Exception as e:
+            self.trainer.logger.warning(
+                "[viz] failed for epoch {}: {}: {}. Skipping.".format(
+                    self.trainer.epoch + 1, type(e).__name__, e,
+                )
+            )
+
+    def _after_epoch_impl(self):
         if not self.trainer.cfg.evaluate:
             return
         epoch = self.trainer.epoch + 1

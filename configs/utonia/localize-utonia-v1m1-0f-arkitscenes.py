@@ -236,7 +236,14 @@ hooks = [
     # has something to compare against; also reports AccAll@IoU across every
     # mentioned entity, not just the primary one).
     dict(
-        type="Locate3DSegDetectorEvaluator", iou_thresholds=(0.25, 0.5)
+        type="Locate3DSegDetectorEvaluator",
+        iou_thresholds=(0.25, 0.5),
+        # Eval is the main wall-clock sink after each epoch. Only run
+        # it every 5 epochs. Skipped epochs set a sentinel metric so
+        # CheckpointSaver / MetricsLogger stay well-defined. Per-batch
+        # errors (proxy / NFS / DataLoader worker) are caught and
+        # training continues regardless.
+        eval_every_n_epochs=5,
     ),
     dict(type="Locate3DMetricsLogger", log_train_every=1),
     dict(type="CheckpointSaver", save_freq=None),

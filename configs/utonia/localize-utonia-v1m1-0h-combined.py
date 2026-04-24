@@ -316,6 +316,11 @@ hooks = [
     dict(
         type="Locate3DSegDetectorEvaluator",
         iou_thresholds=(0.25, 0.5),
+        # Combined-corpus val (ARKit+ScanNet+ScanNetPP) is much larger
+        # than ARKit-only, so evaluate less often to keep wall-clock
+        # reasonable. Resilient to proxy / DataLoader-worker errors --
+        # a failed eval is logged and training continues.
+        eval_every_n_epochs=5,
     ),
     dict(type="Locate3DMetricsLogger", log_train_every=1),
     dict(type="CheckpointSaver", save_freq=None),

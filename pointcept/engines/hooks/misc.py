@@ -174,8 +174,16 @@ class CheckpointSaver(HookBase):
         if is_main_process():
             is_best = False
             if self.trainer.cfg.evaluate:
-                current_metric_value = self.trainer.comm_info["current_metric_value"]
-                current_metric_name = self.trainer.comm_info["current_metric_name"]
+                # Use ``.get()`` with sentinels so a skipped / failed /
+                # not-yet-populated eval can't crash the training loop
+                # here. Evaluators that bail early are expected to set
+                # current_metric_value=-1.0 (never beats best).
+                current_metric_value = self.trainer.comm_info.get(
+                    "current_metric_value", -1.0
+                )
+                current_metric_name = self.trainer.comm_info.get(
+                    "current_metric_name", "metric"
+                )
                 if current_metric_value > self.trainer.best_metric_value:
                     self.trainer.best_metric_value = current_metric_value
                     is_best = True
