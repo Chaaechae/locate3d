@@ -78,12 +78,22 @@ arkit_root = "/group-volume/3Ddataset/arkitscenes-compressed"
 scannet_root = "/group-volume/3Ddataset/scannet-compressed"
 scannetpp_root = "/group-volume/3Ddataset/scannetpp-compressed"
 
-arkit_train_ann = "locate-3d/locate3d_data/train_arkitscenes.json"
-arkit_val_ann = "locate-3d/locate3d_data/val_arkitscenes.json"
+# --- Dataset inclusion env-var guards ---
+# Set the following before launching to opt sub-corpora out for ablations:
+#   LOCATE3D_USE_ARKIT=0      -> drop ARKitScenes from train + val
+#   LOCATE3D_USE_SCANNETPP=0  -> drop ScanNet++ from train + val
+# Default = "1" = include. The empty annotation paths below cause _maybe()
+# to skip the dataset cleanly without rebuilding any Compose pipelines.
+import os as _os
+_USE_ARKIT = _os.environ.get("LOCATE3D_USE_ARKIT", "1") == "1"
+_USE_SCANNETPP = _os.environ.get("LOCATE3D_USE_SCANNETPP", "1") == "1"
+
+arkit_train_ann = "locate-3d/locate3d_data/train_arkitscenes.json" if _USE_ARKIT else None
+arkit_val_ann = "locate-3d/locate3d_data/val_arkitscenes.json" if _USE_ARKIT else None
 scannet_train_ann = "locate-3d/locate3d_data/train_scannet.json"
 scannet_val_ann = "locate-3d/locate3d_data/val_scannet.json"
-scannetpp_train_ann = "locate-3d/locate3d_data/train_scannetpp.json"
-scannetpp_val_ann = "locate-3d/locate3d_data/val_scannetpp.json"
+scannetpp_train_ann = "locate-3d/locate3d_data/train_scannetpp.json" if _USE_SCANNETPP else None
+scannetpp_val_ann = "locate-3d/locate3d_data/val_scannetpp.json" if _USE_SCANNETPP else None
 
 # Pass -w on the CLI to start from a 0i / 0h checkpoint; this is the
 # default empty path which would mean "from scratch" (not recommended
@@ -98,6 +108,12 @@ model = dict(
     freeze_backbone=False,
     freeze_text_encoder=True,
     text_encoder="clip",
+    # Encoder unfrozen -> all PT-v3m3 transformer block activations are
+    # otherwise stored for backward, which is the dominant memory cost
+    # at H100 x4. Recompute via gradient checkpointing instead. Cuts
+    # peak VRAM ~40-60% at the cost of one extra forward (~30% slower
+    # per step). Critical for fitting bs/gpu>1 with encoder unfrozen.
+    backbone_grad_checkpoint=True,
     loss_weight_bce=1.0,
     loss_weight_dice=2.0,
     bce_pos_weight=30.0,
@@ -355,6 +371,7 @@ hooks = [
 ]
 
 del _maybe, _train_datasets, _val_datasets
+del _os, _USE_ARKIT, _USE_SCANNETPP
 del _common_keys, _arkit_aug, _scannet_aug
 del train_transform_arkit, train_transform_scannet
 del val_transform_arkit, val_transform_scannet

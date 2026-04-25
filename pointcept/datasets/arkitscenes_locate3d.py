@@ -27,12 +27,21 @@ from .transform import Compose
 
 
 def _load_clip_tokenizer():
-    """Lazy-load the CLIP tokenizer shared across workers."""
+    """Lazy-load the CLIP tokenizer shared across workers.
+
+    Loaded from a local mount (default ``/group-volume/CLIP/clip-vit-large-patch14``,
+    override via env var ``LOCATE3D_CLIP_PATH``). This avoids the cluster's
+    flaky outbound proxy that intermittently fails ``from_pretrained`` HF
+    downloads when many DataLoader workers warm up together.
+    """
     from transformers import AutoTokenizer
 
     if not hasattr(_load_clip_tokenizer, "_tok"):
+        clip_path = os.environ.get(
+            "LOCATE3D_CLIP_PATH", "/group-volume/CLIP/clip-vit-large-patch14"
+        )
         _load_clip_tokenizer._tok = AutoTokenizer.from_pretrained(
-            "openai/clip-vit-large-patch14"
+            clip_path, local_files_only=True
         )
     return _load_clip_tokenizer._tok
 

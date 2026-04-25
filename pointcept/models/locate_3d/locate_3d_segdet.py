@@ -96,6 +96,14 @@ class Locate3DSegDetector(nn.Module):
         max_points_train: int = 40000,
         max_points_eval: int = 40000,
         infer_threshold: float = 0.5,
+        # Memory: gradient-checkpoint the backbone forward. Activations are
+        # discarded and recomputed during backward, so the encoder's huge
+        # transformer-block intermediates never sit in memory at the same
+        # time as the gradient buffers. Saves ~40-60% of per-step VRAM at
+        # the cost of one extra encoder forward (~30-40% slower step).
+        # Auto-disabled when the backbone is frozen (no backward = no
+        # activations to save).
+        backbone_grad_checkpoint: bool = False,
     ):
         super().__init__()
         self.backbone = build_model(backbone)
@@ -103,6 +111,7 @@ class Locate3DSegDetector(nn.Module):
         if self.freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad = False
+        self.backbone_grad_checkpoint = bool(backbone_grad_checkpoint) and not self.freeze_backbone
 
         self.d_model = d_model
         # Point feature projector: pretrained encoder dim → shared d_model
@@ -163,6 +172,13 @@ class Locate3DSegDetector(nn.Module):
         if self.freeze_backbone:
             with torch.no_grad():
                 point = self.backbone(point)
+        elif self.backbone_grad_checkpoint and self.training:
+            # Recompute backbone forward during backward instead of
+            # storing all encoder activations. Use ``use_reentrant=False``
+            # so checkpoint plays nice with DDP find_unused_parameters
+            # and with our Point-dict input/output.
+            from torch.utils.checkpoint import checkpoint
+            point = checkpoint(self.backbone, point, use_reentrant=False)
         else:
             point = self.backbone(point)
         if isinstance(point, Point):
