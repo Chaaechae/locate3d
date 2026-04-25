@@ -124,7 +124,7 @@ class Locate3DSegDetector(nn.Module):
 
         assert text_encoder in ["clip", "clip-large"], "Only CLIP models supported"
         clip_name = _os.environ.get(
-            "LOCATE3D_CLIP_PATH", "/group-volume/CLIP"
+            "LOCATE3D_CLIP_PATH", "/group-volume/CLIP/clip-vit-large-patch14"
         )
         self.tokenizer = AutoTokenizer.from_pretrained(
             clip_name, local_files_only=True
