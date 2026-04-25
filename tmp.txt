@@ -1,0 +1,8 @@
+python3 -c "
+import numpy as np
+import os
+d = '/group-volume/3Ddataset/scannetpp-compressed/train'
+sample = sorted(os.listdir(d))[0]
+i = np.load(f'{d}/{sample}/instance.npy')
+print('shape:', i.shape, 'dtype:', i.dtype, 'unique[:10]:', np.unique(i)[:10] if i.ndim==1 else np.unique(i[:,0])[:10])
+"
