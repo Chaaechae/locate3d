@@ -1,1 +1,63 @@
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# ─────────────────────────────────────────────
+# 1) 0h-combined: ARKit + ScanNet + ScanNet++ (전부 포함)
+# ─────────────────────────────────────────────
+DIST_BACKEND=gloo \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+sh scripts/train.sh -m 1 -g 4 -d utonia \
+  -c localize-utonia-v1m1-0h-combined \
+  -n 0h-combined-all \
+  -w exp/utonia/pretrain-utonia-v1m1-0-base_stagev2/model/model_last.pth
+
+# ─────────────────────────────────────────────
+# 2) 0h-scannet (scannet+scannetpp): ARKit 제외
+# ─────────────────────────────────────────────
+DIST_BACKEND=gloo \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+LOCATE3D_USE_ARKIT=0 \
+sh scripts/train.sh -m 1 -g 4 -d utonia \
+  -c localize-utonia-v1m1-0h-combined \
+  -n 0h-combined-no-arkit \
+  -w exp/utonia/pretrain-utonia-v1m1-0-base_stagev2/model/model_last.pth
+
+# ─────────────────────────────────────────────
+# 3) 2-stage with ARKit/ScanNet/ScanNet++ : 0i → 0j
+# ─────────────────────────────────────────────
+# stage 1
+DIST_BACKEND=gloo \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+sh scripts/train.sh -m 1 -g 4 -d utonia \
+  -c localize-utonia-v1m1-0i-tune \
+  -n 0i-tune-all \
+  -w exp/utonia/pretrain-utonia-v1m1-0-base_stagev2/model/model_last.pth
+
+# stage 2 (위 0i best ckpt 로 시작; 경로는 실제 경로로 교체)
+DIST_BACKEND=gloo \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+sh scripts/train.sh -m 1 -g 4 -d utonia \
+  -c localize-utonia-v1m1-0j-encoder-ft \
+  -n 0j-encoder-ft-all \
+  -w exp/utonia/0i-tune-all/model/model_best.pth
+
+# ─────────────────────────────────────────────
+# 4) 2-stage scannet+scannetpp only (ARKit 제외): 0i → 0j
+#    (case 4 가 case 3 와 글자가 같았는데 4-way 비교라면 보통 이쪽일 거야;
+#     의도가 다르면 알려줘)
+# ─────────────────────────────────────────────
+# stage 1
+DIST_BACKEND=gloo \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+LOCATE3D_USE_ARKIT=0 \
+sh scripts/train.sh -m 1 -g 4 -d utonia \
+  -c localize-utonia-v1m1-0i-tune \
+  -n 0i-tune-no-arkit \
+  -w exp/utonia/pretrain-utonia-v1m1-0-base_stagev2/model/model_last.pth
+
+# stage 2
+DIST_BACKEND=gloo \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+LOCATE3D_USE_ARKIT=0 \
+sh scripts/train.sh -m 1 -g 4 -d utonia \
+  -c localize-utonia-v1m1-0j-encoder-ft \
+  -n 0j-encoder-ft-no-arkit \
+  -w exp/utonia/0i-tune-no-arkit/model/model_best.pth
