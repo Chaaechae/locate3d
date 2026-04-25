@@ -272,10 +272,18 @@ class _BaseScanNetFamilyLocate3DDataset(Dataset):
             "normal", np.zeros_like(coord, dtype=np.float32)
         ).astype(np.float32)
         instance = scene["instance"]
-        if instance.ndim == 2:
-            # ScanNet++ stores (N, K); take the first channel.
-            instance = instance[:, 0]
-        instance = instance.reshape(-1).astype(np.int64)
+        # ScanNet ships ``instance.npy`` as (N,) int.
+        # ScanNet++ ships it as (N, K) int16: a point can be tagged with
+        # up to K=3 overlapping instance IDs (e.g. a point on a book
+        # resting on a chair belongs to BOTH the book AND the chair
+        # instance). Reducing to ``instance[:, 0]`` drops the top-2/3
+        # labels and leaves many entity masks empty -- which was the
+        # earlier "ScanNet++ doesn't work" failure mode. Preserve the
+        # 2D form here; the mask construction in __getitem__ matches
+        # against ANY channel.
+        if instance.ndim == 1:
+            instance = instance.reshape(-1, 1)
+        instance = instance.astype(np.int64)
 
         oids = self._ordered_object_ids(ann)
         primary_idx = 0  # by construction: primary is first in oids
@@ -328,9 +336,15 @@ class _BaseScanNetFamilyLocate3DDataset(Dataset):
 
         inst = instance_t if isinstance(instance_t, torch.Tensor) else torch.as_tensor(instance_t)
         coord = coord_t if isinstance(coord_t, torch.Tensor) else torch.as_tensor(coord_t)
-        oids_t = torch.as_tensor(oids, dtype=inst.dtype)  # (G,)
+        oids_t = torch.as_tensor(oids, dtype=inst.dtype)            # (G,)
 
-        masks = inst.unsqueeze(0) == oids_t.unsqueeze(1)  # (G, N) bool
+        # Make ``inst`` uniformly (N, K) so we can do the same broadcast
+        # for both ScanNet (K=1) and ScanNet++ (K=3). A point belongs to
+        # entity g iff oid_g matches ANY of its K instance channels.
+        if inst.dim() == 1:
+            inst = inst.unsqueeze(-1)                                # (N, 1)
+        # (G, N) = any over K of (G, 1, 1) == (1, N, K)
+        masks = (inst.unsqueeze(0) == oids_t.view(-1, 1, 1)).any(dim=-1)
         boxes = torch.zeros((masks.shape[0], 6), dtype=torch.float32)
         for g in range(masks.shape[0]):
             m = masks[g]
