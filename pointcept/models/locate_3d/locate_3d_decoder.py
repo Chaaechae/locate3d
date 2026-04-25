@@ -244,7 +244,7 @@ class Locate3DDecoder(nn.Module):
         # path via env var ``LOCATE3D_CLIP_PATH``; default ``/group-volume/CLIP``.
         import os as _os
         self.clip_model = _os.environ.get(
-            "LOCATE3D_CLIP_PATH", "/group-volume/CLIP"
+            "LOCATE3D_CLIP_PATH", "/group-volume/CLIP/clip-vit-large-patch14"
         )
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.clip_model, local_files_only=True
