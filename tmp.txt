@@ -87,3 +87,26 @@ sh scripts/train.sh -m 1 -g 4 -d utonia \
   -c localize-utonia-v1m1-0j-encoder-ft \
   -n 0j-encoder-ft-no-arkit \
   -w exp/utonia/0i-tune-no-arkit/model/model_best.pth
+
+
+# Common envs
+COMMON='DIST_BACKEND=gloo PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True'
+PRETRAIN='exp/utonia/pretrain-utonia-v1m1-0-base_stagev2/model/model_last.pth'
+
+# 1) 0h all
+$COMMON sh scripts/train.sh -m 1 -g 4 -d utonia \
+  -c localize-utonia-v1m1-0h-combined -n 0h-all -w $PRETRAIN
+
+# 2) 0h scannet+scannetpp (no arkit)
+$COMMON LOCATE3D_USE_ARKIT=0 sh scripts/train.sh -m 1 -g 4 -d utonia \
+  -c localize-utonia-v1m1-0h-combined -n 0h-no-arkit -w $PRETRAIN
+
+# 3) 0h all → 0j all (위 #1 끝난 다음)
+$COMMON sh scripts/train.sh -m 1 -g 4 -d utonia \
+  -c localize-utonia-v1m1-0j-encoder-ft -n 0j-all \
+  -w exp/utonia/0h-all/model/model_best.pth
+
+# 4) 0h no-arkit → 0j no-arkit (위 #2 끝난 다음)
+$COMMON LOCATE3D_USE_ARKIT=0 sh scripts/train.sh -m 1 -g 4 -d utonia \
+  -c localize-utonia-v1m1-0j-encoder-ft -n 0j-no-arkit \
+  -w exp/utonia/0h-no-arkit/model/model_best.pth
