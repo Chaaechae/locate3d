@@ -114,17 +114,21 @@ model = dict(
     # peak VRAM ~40-60% at the cost of one extra forward (~30% slower
     # per step). Critical for fitting bs/gpu>1 with encoder unfrozen.
     backbone_grad_checkpoint=True,
+    # Roll back to 0h-style loss / inference knobs. The 0i "tune for
+    # real masks" attempt (pos_weight 100->30, dice 5->2,
+    # infer_threshold 0.5->0.55) was measured worse: ARKit+ScanNet
+    # val_Acc@0.25 0.54 (0h@e15) -> 0.20 (0i@e100). Keep 0h's
+    # recall-favouring values which empirically work for the
+    # mask-AABB-as-bbox metric.
     loss_weight_bce=1.0,
-    loss_weight_dice=2.0,
-    bce_pos_weight=30.0,
-    # 60k -> 30k. With encoder unfrozen, the encoder's activations are
-    # stored for backward (they were freed under freeze in 0i), so per-
-    # scene memory roughly doubles vs 0i. Halving max_points keeps the
-    # peak workable AND lets us raise batch_size to 16 (more parallelism
-    # per H100 step -> higher GPU utilization).
-    max_points_train=30000,
-    max_points_eval=30000,
-    infer_threshold=0.55,
+    loss_weight_dice=5.0,
+    bce_pos_weight=100.0,
+    # max_points trimmed from 0h's 40k -> 24k for memory headroom under
+    # encoder-unfrozen training; combined with batch_size and
+    # backbone_grad_checkpoint above this fits H100 x4 reliably.
+    max_points_train=24000,
+    max_points_eval=24000,
+    infer_threshold=0.5,
     backbone=dict(
         type="PT-v3m3",
         in_channels=9,

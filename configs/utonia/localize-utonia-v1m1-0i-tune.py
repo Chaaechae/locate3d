@@ -91,13 +91,29 @@ model = dict(
     freeze_backbone=False,
     freeze_text_encoder=True,
     text_encoder="clip",
-    # 0i deltas vs 0h:
+    # 0i v2: previous attempt at "tune for real masks" (pos_weight 100->30,
+    # dice 5->2, infer_threshold 0.5->0.55, max_points 40k->60k) was
+    # MEASURED WORSE -- ARKit+ScanNet val_Acc@0.25 fell from 0.54 (0h
+    # epoch 15) to 0.20 (0i previous, epoch 100). Likely culprits:
+    # (1) infer_threshold=0.55 systematically shrinks predicted masks
+    #     and the AABB derived from them -- IoU collapses, especially
+    #     against larger GT boxes.
+    # (2) Lower pos_weight + lower dice weight removed the recall-bias
+    #     that 0h was implicitly tuned for. In grounding, slightly
+    #     OVER-sized predicted boxes still pass IoU > 0.25 against
+    #     decent GT coverage; under-sized boxes don't. The original
+    #     0h hyperparameters were not arbitrary -- they were
+    #     task-aligned recall-favouring choices.
+    #
+    # Reverting to 0h hyperparameters so 0i now serves a clean role:
+    # "0h, but a longer schedule + the env-var dataset toggles, ready
+    # to produce the stage-1 checkpoint for 0j to fine-tune from".
     loss_weight_bce=1.0,
-    loss_weight_dice=2.0,         # was 5.0
-    bce_pos_weight=30.0,          # was 100.0
-    max_points_train=60000,       # was 40000
-    max_points_eval=60000,        # was 40000
-    infer_threshold=0.55,         # was 0.5
+    loss_weight_dice=5.0,
+    bce_pos_weight=100.0,
+    max_points_train=40000,
+    max_points_eval=40000,
+    infer_threshold=0.5,
     backbone=dict(
         type="PT-v3m3",
         in_channels=9,
