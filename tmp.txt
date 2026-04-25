@@ -1,3 +1,29 @@
+# (한 번) cache 생성 — 이미 했으면 skip
+python -m preprocessing.run_preprocessing \
+    --l3dd_annotations_fpath locate-3d/locate3d_data/val_scannet.json \
+    --scannet_data_dir   /path/to/scannet/raw \
+    --scannetpp_data_dir /path/to/scannetpp/raw \
+    --arkitscenes_data_dir /path/to/arkit/raw
+
+# Eval (각 split 별 1회)
+python tools/eval_locate3d_baseline.py \
+    --annotations locate-3d/locate3d_data/val_scannet.json \
+    --scannet-data-dir   /path/to/scannet/raw \
+    --weight /group-volume/locate-3d/model.safetensors \
+    --output eval_locate3d_scannet.json
+
+python tools/eval_locate3d_baseline.py \
+    --annotations locate-3d/locate3d_data/val_scannetpp.json \
+    --scannetpp-data-dir /path/to/scannetpp/raw \
+    --weight /group-volume/locate-3d/model.safetensors \
+    --output eval_locate3d_scannetpp.json
+
+python tools/eval_locate3d_baseline.py \
+    --annotations locate-3d/locate3d_data/val_arkitscenes.json \
+    --arkitscenes-data-dir /path/to/arkit/raw \
+    --weight /group-volume/locate-3d/model.safetensors \
+    --output eval_locate3d_arkit.json
+----------------------------------------
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # ─────────────────────────────────────────────
 # 1) 0h-combined: ARKit + ScanNet + ScanNet++ (전부 포함)
