@@ -111,13 +111,27 @@ class Locate3DSegDetector(nn.Module):
             nn.LayerNorm(d_model, eps=1e-12),
         )
 
-        # CLIP text encoder (frozen by default; same convention as Locate-3D)
+        # CLIP text encoder (frozen by default; same convention as Locate-3D).
+        # Loaded from a local mount instead of huggingface hub; the cluster's
+        # outbound proxy is flaky and intermittently fails the
+        # ``from_pretrained`` HF download, killing entire training runs at
+        # epoch 0. The directory at ``LOCATE3D_CLIP_PATH`` (default
+        # ``/group-volume/CLIP``) must contain the standard HF layout
+        # (config.json, model.safetensors / pytorch_model.bin, tokenizer*).
+        # ``local_files_only=True`` ensures from_pretrained never reaches out.
+        import os as _os
         from transformers import AutoTokenizer, CLIPTextModelWithProjection
 
         assert text_encoder in ["clip", "clip-large"], "Only CLIP models supported"
-        clip_name = "openai/clip-vit-large-patch14"
-        self.tokenizer = AutoTokenizer.from_pretrained(clip_name)
-        self.text_encoder = CLIPTextModelWithProjection.from_pretrained(clip_name)
+        clip_name = _os.environ.get(
+            "LOCATE3D_CLIP_PATH", "/group-volume/CLIP"
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            clip_name, local_files_only=True
+        )
+        self.text_encoder = CLIPTextModelWithProjection.from_pretrained(
+            clip_name, local_files_only=True
+        )
         self.text_hidden = self.text_encoder.config.hidden_size
         self.max_tokens = 77
         self.freeze_text_encoder = freeze_text_encoder

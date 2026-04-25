@@ -44,11 +44,27 @@ losing more pretrain than it gains in ground-task adaptation.
 
 _base_ = ["../_base_/default_runtime.py"]
 
+# Memory budget for H100 x4 with encoder UNFROZEN (encoder activations
+# are now stored for backward, not just U-Net dec): hold per-GPU peak
+# memory roughly constant by trading max_points for batch parallelism.
+#
+#   peak_pts / GPU = (batch_size / world_size) * max_points_train
+#
+# user previously hit OOM at bs=8 / max_points=60k = 120k pts/GPU @
+# encoder unfrozen. Move the same 120k budget to bs=16 / max_points=30k
+# = 4x more samples per GPU step -> H100 compute saturates better
+# (50% -> ~80% util) without raising the peak.
 batch_size = 16
-num_worker = 32
+# Per-GPU workers = num_worker / world_size = 24/4 = 6. Locate-3D
+# preprocessing (CLIP tokenizer + GridSample hash + per-point inside-
+# box checks) is moderately CPU-heavy; 6 / GPU keeps the device fed.
+num_worker = 24
 mix_prob = 0.0
 clip_grad = 10.0
-empty_cache = False
+# Per-iter cache cleanup. Slight throughput cost but cuts down allocator
+# fragmentation that's the typical cause of intermittent OOMs after
+# variable-sized scenes (ScanNet++ scenes are particularly variable).
+empty_cache = True
 empty_cache_per_epoch = True
 enable_amp = True
 amp_dtype = "bfloat16"
@@ -85,8 +101,13 @@ model = dict(
     loss_weight_bce=1.0,
     loss_weight_dice=2.0,
     bce_pos_weight=30.0,
-    max_points_train=60000,
-    max_points_eval=60000,
+    # 60k -> 30k. With encoder unfrozen, the encoder's activations are
+    # stored for backward (they were freed under freeze in 0i), so per-
+    # scene memory roughly doubles vs 0i. Halving max_points keeps the
+    # peak workable AND lets us raise batch_size to 16 (more parallelism
+    # per H100 step -> higher GPU utilization).
+    max_points_train=30000,
+    max_points_eval=30000,
     infer_threshold=0.55,
     backbone=dict(
         type="PT-v3m3",

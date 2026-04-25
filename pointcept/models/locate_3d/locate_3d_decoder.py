@@ -239,9 +239,19 @@ class Locate3DDecoder(nn.Module):
         from transformers import AutoTokenizer, CLIPTextModelWithProjection
 
         assert text_encoder in ["clip", "clip-large"], "Only CLIP models are supported"
-        self.clip_model = "openai/clip-vit-large-patch14"
-        self.tokenizer = AutoTokenizer.from_pretrained(self.clip_model)
-        self.text_encoder = CLIPTextModelWithProjection.from_pretrained(self.clip_model)
+        # Load CLIP from a local mount (see Locate3DSegDetector for context):
+        # the cluster proxy intermittently kills HF hub downloads. Override
+        # path via env var ``LOCATE3D_CLIP_PATH``; default ``/group-volume/CLIP``.
+        import os as _os
+        self.clip_model = _os.environ.get(
+            "LOCATE3D_CLIP_PATH", "/group-volume/CLIP"
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.clip_model, local_files_only=True
+        )
+        self.text_encoder = CLIPTextModelWithProjection.from_pretrained(
+            self.clip_model, local_files_only=True
+        )
         self.text_encoder_hidden_size = self.text_encoder.config.hidden_size
         self.max_tokens = 77
         self.freeze_text_encoder = freeze_text_encoder
