@@ -110,3 +110,31 @@ $COMMON sh scripts/train.sh -m 1 -g 4 -d utonia \
 $COMMON LOCATE3D_USE_ARKIT=0 sh scripts/train.sh -m 1 -g 4 -d utonia \
   -c localize-utonia-v1m1-0j-encoder-ft -n 0j-no-arkit \
   -w exp/utonia/0h-no-arkit/model/model_best.pth
+
+
+# ===== ScanNet =====
+python tools/eval_locate3d_baseline.py \
+    --annotations locate-3d/locate3d_data/val_scannet.json \
+    --scannet-data-dir /group-volume/Scannet \
+    --cache-path /group-volume/ARKitscenes_cache_copy \
+    --weight /group-volume/locate-3d/model.safetensors \
+    --config locate-3d/config/locate_3d.yaml \
+    --output eval_locate3d_scannet.json
+
+# ===== ScanNet++ =====
+python tools/eval_locate3d_baseline.py \
+    --annotations locate-3d/locate3d_data/val_scannetpp.json \
+    --scannetpp-data-dir /group-volume/Scannet++ \
+    --cache-path /group-volume/ARKitscenes_cache_copy \
+    --weight /group-volume/locate-3d/model.safetensors \
+    --config locate-3d/config/locate_3d.yaml \
+    --output eval_locate3d_scannetpp.json
+
+# ===== ARKitScenes (symlink된 root 사용) =====
+python tools/eval_locate3d_baseline.py \
+    --annotations locate-3d/locate3d_data/val_arkitscenes.json \
+    --arkitscenes-data-dir /tmp/arkit_meta_root \
+    --cache-path /group-volume/ARKitscenes_cache_copy \
+    --weight /group-volume/locate-3d/model.safetensors \
+    --config locate-3d/config/locate_3d.yaml \
+    --output eval_locate3d_arkit.json
