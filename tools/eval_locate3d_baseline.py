@@ -502,9 +502,13 @@ def main():
                     "pred_box": pred_b,
                 })
             print(f"[debug] sample {idx} caption={utterance!r}")
+            print(f"        ours.oids={oids}  ours.primary={oids[0] if oids else None}")
+            print(f"        meta.ann.object_ids={ann.get('object_ids')}  "
+                  f"meta.ann.object_id={ann.get('object_id')}")
+            if set(oids) != set(ann.get("object_ids") or []):
+                print(f"        *** OID SET MISMATCH between our resolver "
+                      f"and Meta's add_positive_map_and_obj_ids ***")
             print(f"        n_instances={len(instances)} oids={oids}")
-            print(f"        ann.object_ids={ann.get('object_ids')} "
-                  f"ann.object_id={ann.get('object_id')}")
             la_keys = list(data.get("lang_data", {}).keys())
             la_gt = data.get("lang_data", {}).get("gt_boxes")
             la_gt_shape = (None if la_gt is None else
