@@ -242,7 +242,6 @@ def main():
 
     # Build dataset
     from locate3d_data.locate3d_dataset import Locate3DDataset
-    from models.locate_3d import downsample
 
     dataset = Locate3DDataset(
         annotations_fpath=args.annotations,
@@ -309,20 +308,41 @@ def main():
             continue
 
         # Downsample for speed (Meta's example does the same).
-        # Meta's downsample() builds the index tensor on
-        # ``points.device`` and then indexes every other entry with it.
-        # Some preprocessed caches store tensors on mixed devices
-        # (points on CPU, features on CUDA), which makes the cross-device
-        # gather raise ``indices should be cpu/cuda``. Normalize to CPU
-        # before calling downsample.
+        # Meta's downsample() (locate_3d.py:66) is unsafe in two ways:
+        #   1. It builds indices on ``points.device``, which fails if
+        #      other dict entries are on a different device.
+        #   2. It applies the same indices to *every* entry, even ones
+        #      whose first dim is not ``len(points)`` (e.g. per-frame
+        #      camera tensors of shape (num_frames, ...)), raising
+        #      ``index out of range``.
+        # Replace with a length-aware, CPU-uniform version.
         psp = data["featurized_sensor_pointcloud"]
-        psp = {
-            k: (v.cpu() if torch.is_tensor(v) else v)
-            for k, v in psp.items()
-        }
-        data["featurized_sensor_pointcloud"] = downsample(
-            psp, args.downsample_pts
-        )
+        N = len(psp["points"])
+        if idx == 0:
+            # One-time visibility into cache schema for debugging.
+            print("[cache] keys/shapes:", {
+                k: (tuple(v.shape) if torch.is_tensor(v) else type(v).__name__)
+                for k, v in psp.items()
+            })
+        if N > args.downsample_pts:
+            indices = torch.randperm(N)[:args.downsample_pts]
+            psp_new = {}
+            for k, v in psp.items():
+                if torch.is_tensor(v):
+                    v_cpu = v.cpu()
+                    if v_cpu.dim() >= 1 and v_cpu.shape[0] == N:
+                        psp_new[k] = v_cpu[indices]
+                    else:
+                        psp_new[k] = v_cpu
+                else:
+                    psp_new[k] = v
+            psp = psp_new
+        else:
+            psp = {
+                k: (v.cpu() if torch.is_tensor(v) else v)
+                for k, v in psp.items()
+            }
+        data["featurized_sensor_pointcloud"] = psp
 
         ann = annos[idx]
         utterance = data["lang_data"]["text_caption"]
