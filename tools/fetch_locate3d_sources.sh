@@ -27,6 +27,10 @@ FILES=(
     "models/point_transformer_v3.py"
     "models/model_utils/__init__.py"
     "models/model_utils/bbox_utils.py"
+    "models/model_utils/serialization/__init__.py"
+    "models/model_utils/serialization/default.py"
+    "models/model_utils/serialization/z_order.py"
+    "models/model_utils/serialization/hilbert.py"
 )
 
 mkdir -p "${DEST_ROOT}"
