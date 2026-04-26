@@ -274,9 +274,22 @@ class Locate3DDecoder(nn.Module):
 
         # Text Encoding Model
         assert text_encoder in ["clip", "clip-large"], "Only CLIP models are supported"
-        self.clip_model = "openai/clip-vit-large-patch14"
-        self.tokenizer = AutoTokenizer.from_pretrained(self.clip_model)
-        self.text_encoder = CLIPTextModelWithProjection.from_pretrained(self.clip_model)
+        # Allow overriding the CLIP model location via env var so we can
+        # point at a locally-cached HF snapshot (the cluster has no
+        # outbound HF access). Defaults to the HF hub id; if a local path
+        # is given we also force ``local_files_only`` so we never try to
+        # phone home.
+        import os as _os
+        self.clip_model = _os.environ.get(
+            "LOCATE3D_CLIP_PATH", "openai/clip-vit-large-patch14"
+        )
+        _local_only = _os.path.isdir(self.clip_model)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.clip_model, local_files_only=_local_only
+        )
+        self.text_encoder = CLIPTextModelWithProjection.from_pretrained(
+            self.clip_model, local_files_only=_local_only
+        )
         self.text_encoder_hidden_size = self.text_encoder.config.hidden_size
         self.max_tokens = 77
 
