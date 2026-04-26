@@ -371,7 +371,10 @@ def main():
         #   - ARKit: ann["gt_boxes"][oid] is (3, 2) min/max.
         #   - ScanNet / ScanNet++: no gt_boxes in JSON -- Locate3DDataset
         #     returns AABB derived from instance mask in
-        #     ``data["lang_data"]["gt_boxes"]`` aligned to oids order.
+        #     ``data["lang_data"]["gt_boxes"]`` aligned to the order in
+        #     ``ann["object_ids"]`` (set in-place by
+        #     ``add_positive_map_and_obj_ids`` during dataset[idx]).
+        ann_oids = ann.get("object_ids", []) or []
         gt_boxes_xyzxyz = []
         for oid in oids:
             box = None
@@ -379,12 +382,9 @@ def main():
                 box = _xyzxyz_from_anything(gt_boxes_raw[oid])
             else:
                 gt_arr = data["lang_data"].get("gt_boxes", None)
-                if gt_arr is not None:
-                    # Meta returns a torch tensor of shape (G, 3, 2).
-                    gt_idx = list(data["lang_data"].get("object_ids", oids)).index(oid) \
-                        if oid in list(data["lang_data"].get("object_ids", [])) \
-                        else None
-                    if gt_idx is not None and gt_idx < len(gt_arr):
+                if gt_arr is not None and oid in ann_oids:
+                    gt_idx = ann_oids.index(oid)
+                    if gt_idx < len(gt_arr):
                         box = _xyzxyz_from_anything(gt_arr[gt_idx].cpu().numpy())
             gt_boxes_xyzxyz.append(box)
 
