@@ -212,7 +212,11 @@ def _load_model(weight_path, config_path):
         print(f"[load] sample missing: {info.missing_keys[:5]}")
     if info.unexpected_keys:
         print(f"[load] sample unexpected: {info.unexpected_keys[:5]}")
-    model = model.cuda().eval()
+    # Meta's Locate3D.train() override does not return self, so .eval()
+    # propagates None back to the caller. Mutate in-place instead of
+    # reassigning so we keep the loaded module.
+    model.cuda()
+    model.eval()
     return model
 
 
