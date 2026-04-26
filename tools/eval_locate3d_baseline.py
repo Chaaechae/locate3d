@@ -61,6 +61,20 @@ _LOCATE3D = os.path.join(_REPO, "locate-3d")
 if _LOCATE3D not in sys.path:
     sys.path.insert(0, _LOCATE3D)
 
+# Make ``tools/_pytorch3d_shim.py`` importable + install the shim BEFORE
+# any Meta module loads. ``models.encoder_3djepa`` imports
+# ``pytorch3d.renderer.implicit.harmonic_embedding.HarmonicEmbedding`` at
+# top level; if real pytorch3d is not installed (it requires a CUDA build
+# toolchain that's painful to set up on the cluster), the shim provides a
+# bit-exact replacement registered under the same import path.
+_TOOLS = os.path.dirname(os.path.abspath(__file__))
+if _TOOLS not in sys.path:
+    sys.path.insert(0, _TOOLS)
+from _pytorch3d_shim import install_shim as _install_pytorch3d_shim  # noqa: E402
+_shim_installed = _install_pytorch3d_shim()
+if _shim_installed:
+    print("[shim] real pytorch3d not found; using local HarmonicEmbedding shim")
+
 
 def _iou_3d_xyzxyz(a, b):
     """3D IoU between two xyzxyz boxes (numpy arrays of length 6)."""
