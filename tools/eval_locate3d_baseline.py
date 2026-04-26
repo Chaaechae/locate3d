@@ -375,18 +375,44 @@ def main():
         #     ``ann["object_ids"]`` (set in-place by
         #     ``add_positive_map_and_obj_ids`` during dataset[idx]).
         ann_oids = ann.get("object_ids", []) or []
+        gt_arr = data["lang_data"].get("gt_boxes", None)
         gt_boxes_xyzxyz = []
+        gt_resolve_log = []  # for debug: per-oid (which branch, why None)
         for oid in oids:
             box = None
+            why = ""
             if gt_boxes_raw is not None and oid < len(gt_boxes_raw):
-                box = _xyzxyz_from_anything(gt_boxes_raw[oid])
+                raw = gt_boxes_raw[oid]
+                if raw is None:
+                    why = "ann.gt_boxes[oid] is None"
+                else:
+                    box = _xyzxyz_from_anything(raw)
+                    why = "from ann.gt_boxes"
             else:
-                gt_arr = data["lang_data"].get("gt_boxes", None)
-                if gt_arr is not None and oid in ann_oids:
+                if gt_arr is None:
+                    why = "lang_data.gt_boxes is None"
+                elif oid not in ann_oids:
+                    why = f"oid {oid} not in ann.object_ids={ann_oids}"
+                else:
                     gt_idx = ann_oids.index(oid)
-                    if gt_idx < len(gt_arr):
-                        box = _xyzxyz_from_anything(gt_arr[gt_idx].cpu().numpy())
+                    if gt_idx >= len(gt_arr):
+                        why = (f"gt_idx={gt_idx} >= len(gt_arr)={len(gt_arr)}; "
+                               f"ann_oids={ann_oids}")
+                    else:
+                        cand = gt_arr[gt_idx]
+                        if torch.is_tensor(cand):
+                            cand_np = cand.cpu().numpy()
+                        else:
+                            cand_np = np.asarray(cand)
+                        # Empty mask in Meta yields -inf box. Detect.
+                        if not np.isfinite(cand_np).all():
+                            why = (f"lang_data.gt_boxes[{gt_idx}] non-finite "
+                                   f"(empty mask for oid {oid} in seg)")
+                        else:
+                            box = _xyzxyz_from_anything(cand_np)
+                            why = f"from lang_data.gt_boxes[{gt_idx}]"
             gt_boxes_xyzxyz.append(box)
+            gt_resolve_log.append((int(oid), why))
 
         # Run inference. Model lives on cuda; move the (now-cpu)
         # featurized point cloud onto cuda so the encoder can ingest it.
@@ -477,7 +503,18 @@ def main():
                 })
             print(f"[debug] sample {idx} caption={utterance!r}")
             print(f"        n_instances={len(instances)} oids={oids}")
-            print(f"        word_to_clip(first 5)={dict(list(word_to_clip.items())[:5])}")
+            print(f"        ann.object_ids={ann.get('object_ids')} "
+                  f"ann.object_id={ann.get('object_id')}")
+            la_keys = list(data.get("lang_data", {}).keys())
+            la_gt = data.get("lang_data", {}).get("gt_boxes")
+            la_gt_shape = (None if la_gt is None else
+                           tuple(la_gt.shape) if torch.is_tensor(la_gt)
+                           else type(la_gt).__name__)
+            print(f"        lang_data.keys={la_keys} "
+                  f"lang_data.gt_boxes.shape={la_gt_shape}")
+            print(f"        gt_resolve={gt_resolve_log}")
+            print(f"        word_to_clip(first 5)="
+                  f"{dict(list(word_to_clip.items())[:5])}")
             for e in ent_dbg:
                 print("       ", e)
 
