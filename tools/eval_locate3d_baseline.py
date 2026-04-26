@@ -309,8 +309,19 @@ def main():
             continue
 
         # Downsample for speed (Meta's example does the same).
+        # Meta's downsample() builds the index tensor on
+        # ``points.device`` and then indexes every other entry with it.
+        # Some preprocessed caches store tensors on mixed devices
+        # (points on CPU, features on CUDA), which makes the cross-device
+        # gather raise ``indices should be cpu/cuda``. Normalize to CPU
+        # before calling downsample.
+        psp = data["featurized_sensor_pointcloud"]
+        psp = {
+            k: (v.cpu() if torch.is_tensor(v) else v)
+            for k, v in psp.items()
+        }
         data["featurized_sensor_pointcloud"] = downsample(
-            data["featurized_sensor_pointcloud"], args.downsample_pts
+            psp, args.downsample_pts
         )
 
         ann = annos[idx]
@@ -350,12 +361,15 @@ def main():
                         box = _xyzxyz_from_anything(gt_arr[gt_idx].cpu().numpy())
             gt_boxes_xyzxyz.append(box)
 
-        # Run inference
+        # Run inference. Model lives on cuda; move the (now-cpu)
+        # featurized point cloud onto cuda so the encoder can ingest it.
+        psp_cuda = {
+            k: (v.cuda(non_blocking=True) if torch.is_tensor(v) else v)
+            for k, v in data["featurized_sensor_pointcloud"].items()
+        }
         try:
             with torch.no_grad():
-                instances = model.inference(
-                    data["featurized_sensor_pointcloud"], utterance
-                )
+                instances = model.inference(psp_cuda, utterance)
         except Exception as e:
             print(f"[skip] inference failed for sample {idx}: "
                   f"{type(e).__name__}: {e}")
