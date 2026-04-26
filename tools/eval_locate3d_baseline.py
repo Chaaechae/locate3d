@@ -454,6 +454,33 @@ def main():
             n_pred_instances=len(instances),
         ))
 
+        # First few samples: dump everything we need to diagnose
+        # Acc@0.25 == 0.
+        if idx < 3:
+            ent_dbg = []
+            for oid in oids:
+                ii, ov, cf = per_entity_best[oid]
+                gt_idx = oids.index(oid)
+                gt_b = gt_boxes_xyzxyz[gt_idx]
+                pred_b = None
+                if ii is not None:
+                    pb = instances[ii]["bbox"].detach().cpu().numpy()
+                    pred_b = _xyzxyz_from_anything(pb).round(2).tolist()
+                ent_dbg.append({
+                    "oid": int(oid),
+                    "clip_tokens": sorted(clip_tokens_per_oid[oid]),
+                    "best_inst": ii,
+                    "best_overlap": ov,
+                    "gt_box": (None if gt_b is None else
+                               [round(float(x), 2) for x in gt_b]),
+                    "pred_box": pred_b,
+                })
+            print(f"[debug] sample {idx} caption={utterance!r}")
+            print(f"        n_instances={len(instances)} oids={oids}")
+            print(f"        word_to_clip(first 5)={dict(list(word_to_clip.items())[:5])}")
+            for e in ent_dbg:
+                print("       ", e)
+
         if (idx + 1) % 25 == 0 or idx + 1 == n_total:
             dt = time.time() - t0
             metrics_so_far = {
