@@ -272,9 +272,32 @@ def main():
     per_sample_records = []
 
     t0 = time.time()
+    # Track missing-cache count + first few missing paths so the user can
+    # quickly tell whether the cache root, subdir name, or filename
+    # convention is the issue.
+    n_missing_cache = 0
+    missing_cache_examples = []
     for idx in range(n_total):
         try:
             data = dataset[idx]
+        except AssertionError as e:
+            # Meta's Locate3DDataset asserts on missing featurized cache:
+            # ``"Must first run preprocessing..."``. Rebuild the exact
+            # path it looked for so the error is actionable.
+            ann = annos[idx]
+            sid = ann.get("scene_id")
+            sds = ann.get("scene_dataset", "ScanNet")
+            if "frames_used" in ann and ann["frames_used"]:
+                fu = ann["frames_used"]
+                fname = f"{sid}_start{fu[0]}_end{fu[-1]}.pt"
+            else:
+                fname = f"{sid}.pt"
+            expected = os.path.join(args.cache_path, sds, fname)
+            n_missing_cache += 1
+            if len(missing_cache_examples) < 3:
+                missing_cache_examples.append(expected)
+                print(f"[skip] sample {idx} ({sid}): cache file not found at {expected}")
+            continue
         except Exception as e:
             print(f"[skip] sample {idx} ({annos[idx].get('scene_id')}): "
                   f"{type(e).__name__}: {e}")
@@ -414,11 +437,17 @@ def main():
     })
     summary["primary_N"] = total_primary
     summary["all_N"] = total_all
+    summary["missing_cache_N"] = n_missing_cache
 
     print()
     print("=" * 60)
     print("FINAL")
     print("=" * 60)
+    if n_missing_cache:
+        print(f"  [warn] {n_missing_cache}/{n_total} samples skipped: missing cache")
+        print(f"  [warn] examples of paths not found:")
+        for p in missing_cache_examples:
+            print(f"    {p}")
     for k, v in summary.items():
         if isinstance(v, float):
             print(f"  {k}: {v:.4f}")
