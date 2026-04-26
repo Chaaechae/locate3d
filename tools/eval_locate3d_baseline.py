@@ -308,40 +308,47 @@ def main():
             continue
 
         # Downsample for speed (Meta's example does the same).
-        # Meta's downsample() (locate_3d.py:66) is unsafe in two ways:
-        #   1. It builds indices on ``points.device``, which fails if
-        #      other dict entries are on a different device.
-        #   2. It applies the same indices to *every* entry, even ones
-        #      whose first dim is not ``len(points)`` (e.g. per-frame
-        #      camera tensors of shape (num_frames, ...)), raising
-        #      ``index out of range``.
-        # Replace with a length-aware, CPU-uniform version.
-        psp = data["featurized_sensor_pointcloud"]
-        N = len(psp["points"])
+        # Meta's downsample() (locate_3d.py:66) is unsafe:
+        #   1. It builds indices on ``points.device``, breaking on
+        #      mixed-device caches.
+        #   2. It applies one ``randperm(len(points))`` index to every
+        #      entry. Per-frame tensors raise ``index out of range``;
+        #      worse, some preprocessed caches have *different* lengths
+        #      across point-aligned tensors (e.g. points=148641 but
+        #      features_clip=141933) -- Meta's encoder later assumes
+        #      they all match and dies the same way deeper in.
+        # Replace with: pick the min length across the canonical
+        # point-aligned keys (``points`` + ``rgb`` + ``features_*``),
+        # truncate each of those to that min, then sample
+        # ``downsample_pts`` from [0, min_len). Other keys are passed
+        # through unchanged on CPU.
+        psp = {
+            k: (v.cpu() if torch.is_tensor(v) else v)
+            for k, v in data["featurized_sensor_pointcloud"].items()
+        }
+        point_keys = [
+            k for k in psp
+            if k in ("points", "rgb", "features_clip", "features_dino")
+        ]
+        lengths = {k: psp[k].shape[0] for k in point_keys}
+        N = min(lengths.values())
+        if len(set(lengths.values())) > 1:
+            print(f"[cache] sample {idx}: point-key length mismatch {lengths} "
+                  f"-> trimming to {N}")
         if idx == 0:
-            # One-time visibility into cache schema for debugging.
             print("[cache] keys/shapes:", {
                 k: (tuple(v.shape) if torch.is_tensor(v) else type(v).__name__)
                 for k, v in psp.items()
             })
+        # Trim point-aligned keys to common length first, then optionally
+        # downsample.
+        for k in point_keys:
+            if psp[k].shape[0] != N:
+                psp[k] = psp[k][:N]
         if N > args.downsample_pts:
             indices = torch.randperm(N)[:args.downsample_pts]
-            psp_new = {}
-            for k, v in psp.items():
-                if torch.is_tensor(v):
-                    v_cpu = v.cpu()
-                    if v_cpu.dim() >= 1 and v_cpu.shape[0] == N:
-                        psp_new[k] = v_cpu[indices]
-                    else:
-                        psp_new[k] = v_cpu
-                else:
-                    psp_new[k] = v
-            psp = psp_new
-        else:
-            psp = {
-                k: (v.cpu() if torch.is_tensor(v) else v)
-                for k, v in psp.items()
-            }
+            for k in point_keys:
+                psp[k] = psp[k][indices]
         data["featurized_sensor_pointcloud"] = psp
 
         ann = annos[idx]
