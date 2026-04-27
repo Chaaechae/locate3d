@@ -367,11 +367,13 @@ def main():
             if la_gt_masks is not None and args.scene_source == "mesh":
                 # Reorder from ann.object_ids order to our oids order so
                 # entity colors line up with the GT/Pred boxes.
-                m_np = la_gt_masks.cpu().numpy() if torch.is_tensor(la_gt_masks) \
-                    else np.asarray(la_gt_masks)
+                ann_oids = ann.get("object_ids", []) or []
+                m_np = (la_gt_masks.cpu().numpy()
+                        if torch.is_tensor(la_gt_masks)
+                        else np.asarray(la_gt_masks))
                 gt_paint_masks = []
                 for oid in oids:
-                    if oid in ann_oids and m_np is not None:
+                    if oid in ann_oids:
                         gi = ann_oids.index(oid)
                         if gi < m_np.shape[0]:
                             gt_paint_masks.append(m_np[gi].astype(bool))
