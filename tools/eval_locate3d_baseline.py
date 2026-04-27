@@ -234,6 +234,17 @@ def main():
                     help="evaluate only the first N samples (sanity check)")
     ap.add_argument("--downsample-pts", type=int, default=30000)
     ap.add_argument("--iou-thresholds", default="0.25,0.5")
+    ap.add_argument("--mask-threshold", type=float, default=0.5,
+                    help="threshold on per-point sigmoid mask when "
+                         "deriving the predicted box from the mask AABB")
+    ap.add_argument("--box-source", default="pred_box",
+                    choices=("pred_box", "mask_aabb"),
+                    help="pred_box: use the model's pred_boxes head "
+                         "directly. mask_aabb: take the AABB over points "
+                         "where pred_mask sigmoid > --mask-threshold. "
+                         "ScanNet / ScanNet++ GT boxes are themselves "
+                         "AABBs of per-point instance masks, so mask_aabb "
+                         "is the apples-to-apples comparison there.")
     ap.add_argument("--output", default=None,
                     help="optional path to write per-sample + summary JSON")
     args = ap.parse_args()
@@ -454,9 +465,39 @@ def main():
             best_ii, best_overlap, best_conf = per_entity_best[oid]
             iou = 0.0
             if gt_box is not None and best_ii is not None and best_overlap > 0:
-                pred_bbox = instances[best_ii]["bbox"].detach().cpu().numpy()
-                pred_xyzxyz = _xyzxyz_from_anything(pred_bbox)
-                iou = _iou_3d_xyzxyz(pred_xyzxyz, gt_box)
+                inst = instances[best_ii]
+                if args.box_source == "mask_aabb":
+                    # Derive predicted box from per-point sigmoid mask:
+                    # AABB over points whose mask score exceeds threshold.
+                    # Same construction Meta uses for ScanNet GT boxes
+                    # (AABB of instance-mask points), so this is the
+                    # apples-to-apples comparison.
+                    mask = inst.get("mask")
+                    if mask is None:
+                        pred_xyzxyz = None
+                    else:
+                        m = mask.detach().cpu().numpy().reshape(-1)
+                        pts = data["featurized_sensor_pointcloud"]["points"]
+                        pts_np = (pts.cpu().numpy()
+                                  if torch.is_tensor(pts)
+                                  else np.asarray(pts))
+                        # Mask is over the encoder's input points (same N
+                        # as we ran inference on). Align by truncating to
+                        # the shorter of the two.
+                        n_align = min(m.shape[0], pts_np.shape[0])
+                        sel = m[:n_align] > args.mask_threshold
+                        if sel.sum() == 0:
+                            pred_xyzxyz = None
+                        else:
+                            mp = pts_np[:n_align][sel]
+                            pred_xyzxyz = np.concatenate(
+                                [mp.min(0), mp.max(0)]
+                            ).astype(np.float32)
+                else:
+                    pred_bbox = inst["bbox"].detach().cpu().numpy()
+                    pred_xyzxyz = _xyzxyz_from_anything(pred_bbox)
+                if pred_xyzxyz is not None:
+                    iou = _iou_3d_xyzxyz(pred_xyzxyz, gt_box)
 
             per_entity_record.append(dict(
                 oid=int(oid), iou=float(iou), match_overlap=int(best_overlap),
