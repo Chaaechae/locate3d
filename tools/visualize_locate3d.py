@@ -227,6 +227,21 @@ def main():
     ap.add_argument("--no-mask", action="store_true", help="skip mask overlay")
     ap.add_argument("--no-box", action="store_true",
                     help="skip GT/Pred box rendering (point-only mode)")
+    ap.add_argument("--no-pred-box", action="store_true",
+                    help="suppress only predicted bbox edges; GT box "
+                         "still drawn (cleaner with --pred-mode paint)")
+    ap.add_argument("--pred-mode", default="overlay",
+                    choices=("overlay", "paint"),
+                    help="overlay: draw mask points as a separate "
+                         "scatter trace on top of the scene (existing "
+                         "behavior). paint: paint scene points directly "
+                         "with the entity's muted palette color where "
+                         "pred sigmoid > --infer-threshold (Meta "
+                         "dataset_playground.ipynb style). Either way "
+                         "boxes are drawn unless --no-box / --no-pred-box.")
+    ap.add_argument("--show-gt-mask", action="store_true",
+                    help="paint GT entity points with the vivid palette "
+                         "color (uses batch['point_masks']).")
     ap.add_argument("--scene-point-size", type=float, default=2.2,
                     help="plotly marker size for the scene RGB cloud")
     ap.add_argument("--scene-opacity", type=float, default=0.9,
@@ -317,6 +332,28 @@ def main():
         ann = dataset.anns[ds_idx]
         G = max(gt_boxes.shape[0], pred_boxes.shape[0])
 
+        # Optional paint masks. Both align with ``coord`` (no NN
+        # projection needed -- SegDetector runs on the same point set
+        # the dataset returns).
+        N_coord = coord.shape[0]
+        gt_paint_masks = None
+        if args.show_gt_mask:
+            pm = batch.get("point_masks", None)
+            if pm is not None:
+                # collate returns list[B] of (G, N) bool tensors.
+                pm0 = pm[0] if isinstance(pm, list) else pm
+                if torch.is_tensor(pm0):
+                    pm0 = pm0.cpu().numpy()
+                gt_paint_masks = [
+                    pm0[g].astype(bool) for g in range(min(pm0.shape[0], G))
+                ]
+        pred_paint_masks = None
+        if args.pred_mode == "paint" and pred_logits is not None:
+            pred_paint_masks = []
+            for g in range(min(pred_logits.shape[0], G)):
+                prob = 1.0 / (1.0 + np.exp(-pred_logits[g]))
+                pred_paint_masks.append(prob > args.infer_threshold)
+
         # Resolve:
         #   entity_names[g]  = human-readable name per entity
         #   entity_tokens[g] = list of caption words that drove entity g
@@ -332,12 +369,13 @@ def main():
             args.output_dir,
             f"scene{rank:02d}_{args.dataset}_{scene_id}_{ann.get('ann_id', ds_idx)}.html",
         )
+        pred_boxes_render = [] if args.no_pred_box else pred_boxes
         _render_scene(
             out_path=out_path,
             coord=coord,
             color=color,
             gt_boxes=gt_boxes,
-            pred_boxes=pred_boxes,
+            pred_boxes=pred_boxes_render,
             pred_logits=pred_logits,
             infer_threshold=args.infer_threshold,
             caption=caption,
@@ -347,11 +385,16 @@ def main():
             entity_tokens=entity_tokens,
             caption_token_colormap=cap_colormap,
             caption_word_list=cap_words,
-            draw_masks=not args.no_mask,
+            # In paint mode the pred is shown via mesh repainting, so
+            # don't *also* draw a separate scatter overlay (-> visual
+            # noise). In overlay mode the existing --no-mask flag wins.
+            draw_masks=(args.pred_mode != "paint" and not args.no_mask),
             draw_boxes=not args.no_box,
             scene_point_size=args.scene_point_size,
             scene_opacity=args.scene_opacity,
             max_points=args.scene_max_points,
+            gt_paint_masks=gt_paint_masks,
+            pred_paint_masks=pred_paint_masks,
         )
 
         del out, batch, batch_gpu

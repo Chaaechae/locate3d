@@ -161,10 +161,24 @@ def main():
     ap.add_argument("--downsample-pts", type=int, default=30000)
     ap.add_argument("--output-dir", default="viz_baseline/")
     ap.add_argument("--pred-mode", default="both",
-                    choices=("box", "point", "both"),
-                    help="box: only AABB. point: only mask points "
-                         "(sigmoid > --mask-threshold). both: AABB + "
-                         "mask points overlaid.")
+                    choices=("box", "point", "both", "paint"),
+                    help="box: only AABB. point: AABB + scatter overlay "
+                         "of cache points where mask sigmoid > --mask-"
+                         "threshold. both: same as point. paint: paint "
+                         "mesh points (NN-projected from cache mask) "
+                         "with the entity's palette color (Meta's "
+                         "notebook style). paint suppresses the mask "
+                         "scatter overlay; AABB still drawn unless "
+                         "--no-pred-box.")
+    ap.add_argument("--no-pred-box", action="store_true",
+                    help="suppress predicted bbox edges (paint mode "
+                         "often looks cleaner without them)")
+    ap.add_argument("--show-gt-mask", action="store_true",
+                    help="paint GT mesh points with the entity's vivid "
+                         "palette color (Meta dataset_playground.ipynb "
+                         "style). Requires lang_data['gt_masks'] which "
+                         "is populated for ScanNet / ScanNet++ but not "
+                         "ARKitScenes.")
     ap.add_argument("--mask-threshold", type=float, default=0.5)
     ap.add_argument("--scene-point-size", type=float, default=2.2,
                     help="plotly marker size for the scene RGB cloud "
@@ -346,11 +360,51 @@ def main():
                         else np.full_like(cache_coord, 0.5))
             mask_coord_arg = None
 
+        # Per-entity GT mesh masks (Meta gives boolean (G, N_mesh)).
+        gt_paint_masks = None
+        if args.show_gt_mask:
+            la_gt_masks = data["lang_data"].get("gt_masks", None)
+            if la_gt_masks is not None and args.scene_source == "mesh":
+                # Reorder from ann.object_ids order to our oids order so
+                # entity colors line up with the GT/Pred boxes.
+                m_np = la_gt_masks.cpu().numpy() if torch.is_tensor(la_gt_masks) \
+                    else np.asarray(la_gt_masks)
+                gt_paint_masks = []
+                for oid in oids:
+                    if oid in ann_oids and m_np is not None:
+                        gi = ann_oids.index(oid)
+                        if gi < m_np.shape[0]:
+                            gt_paint_masks.append(m_np[gi].astype(bool))
+                            continue
+                    gt_paint_masks.append(None)
+
+        # Per-entity Pred mesh masks (NN-project cache mask -> mesh).
+        pred_paint_masks = None
+        if args.pred_mode == "paint" and args.scene_source == "mesh":
+            from scipy.spatial import cKDTree
+            tree = cKDTree(cache_coord)
+            _, nn_idx = tree.query(bg_coord, k=1)
+            pred_paint_masks = []
+            for gi, oid in enumerate(oids):
+                if (gi >= len(per_entity_mask_logits)
+                        or per_entity_mask_logits[gi] is None):
+                    pred_paint_masks.append(None)
+                    continue
+                cache_logit = per_entity_mask_logits[gi]
+                cache_prob = 1.0 / (1.0 + np.exp(-cache_logit))
+                cache_sel = cache_prob > args.mask_threshold
+                pred_paint_masks.append(cache_sel[nn_idx])
+
         out_html = os.path.join(
             args.output_dir,
             f"baseline_{ann.get('scene_id')}_ann{ann.get('ann_id')}.html",
         )
-        draw_boxes = args.pred_mode in ("box", "both")
+        draw_boxes = args.pred_mode in ("box", "both", "point", "paint")
+        if args.no_pred_box:
+            # Suppress only the *predicted* boxes; GT box still drawn.
+            pred_box_list = []
+        # Mask scatter overlay only in box/point/both modes (paint
+        # already shows pred via mesh repainting).
         draw_masks = args.pred_mode in ("point", "both")
         _render_scene(
             out_path=out_html,
@@ -373,6 +427,8 @@ def main():
             scene_point_size=args.scene_point_size,
             scene_opacity=args.scene_opacity,
             max_points=args.scene_max_points,
+            gt_paint_masks=gt_paint_masks,
+            pred_paint_masks=pred_paint_masks,
         )
 
     print(f"[done] HTMLs under {args.output_dir}")

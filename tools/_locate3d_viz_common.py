@@ -63,6 +63,16 @@ def _box_corners(b):
     )
 
 
+def _hex_to_rgb01(hex_str):
+    """``"#ff00ff"`` -> (1.0, 0.0, 1.0)."""
+    h = hex_str.lstrip("#")
+    return (
+        int(h[0:2], 16) / 255.0,
+        int(h[2:4], 16) / 255.0,
+        int(h[4:6], 16) / 255.0,
+    )
+
+
 def _render_scene(
     out_path, coord, color, gt_boxes, pred_boxes,
     pred_logits=None, infer_threshold=0.5,
@@ -76,16 +86,25 @@ def _render_scene(
     scene_point_size=2.2,
     scene_opacity=0.9,
     mask_coord=None,
+    gt_paint_masks=None,
+    pred_paint_masks=None,
 ):
     """Plotly render of a 3D scene with GT / Pred boxes and optional
-    per-entity mask overlay.
+    per-entity mask overlay or paint-over.
 
     ``coord`` / ``color`` are the *background* point cloud. When
     ``mask_coord`` is provided, the per-entity ``pred_logits`` are
     interpreted as scoring those points (e.g. the cache's downsampled
-    points the model actually ran on) and rendered on top of the
-    background. When ``mask_coord`` is None, ``pred_logits`` is
-    expected to align with ``coord`` itself (pre-existing behavior).
+    points the model actually ran on) and rendered as a separate
+    scatter trace on top of the background. When ``mask_coord`` is
+    None, ``pred_logits`` is expected to align with ``coord`` itself.
+
+    ``gt_paint_masks`` / ``pred_paint_masks`` are lists of length G of
+    boolean arrays of shape ``(N,)`` aligned to ``coord``. When given,
+    the per-point background color array is *overwritten* with the
+    entity's palette color for those points (Meta's notebook
+    convention). Pred takes priority over GT where both paint the
+    same point.
     """
     try:
         import plotly.graph_objects as go
@@ -104,7 +123,28 @@ def _render_scene(
     else:
         idx = np.arange(N)
     c_sub = coord[idx]
-    col_sub = color[idx]
+    col_sub = color[idx].copy()  # writable for paint-over
+
+    # Paint-over: overwrite per-point RGB with entity-palette color.
+    # Apply GT first, then Pred so Pred wins where both paint the same
+    # point (we want to see *where the model actually predicted*).
+    def _apply_paint(masks, palette):
+        if masks is None:
+            return
+        for g, m in enumerate(masks):
+            if m is None:
+                continue
+            m_arr = np.asarray(m).astype(bool).reshape(-1)
+            if m_arr.shape[0] != N:
+                continue
+            sel = m_arr[idx]
+            if sel.any():
+                col_sub[sel] = np.array(
+                    _hex_to_rgb01(palette[g % len(palette)]),
+                    dtype=col_sub.dtype,
+                )
+    _apply_paint(gt_paint_masks, _VIVID_PALETTE)
+    _apply_paint(pred_paint_masks, _MUTED_PALETTE)
 
     # Mask overlay coordinates. If a separate mask_coord was provided
     # (the points the model actually ran inference on), keep the full
