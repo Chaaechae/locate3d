@@ -82,6 +82,147 @@ from _locate3d_viz_common import (  # noqa: E402
 )
 
 
+def _load_checkpoint(model, weight_path):
+    """Load ``weight_path`` into ``model``, stripping any 'module.'
+    prefix (training runs save with DDP wrapping)."""
+    ckpt = torch.load(weight_path, map_location="cpu", weights_only=False)
+    state = ckpt.get("state_dict", ckpt)
+    cleaned = {}
+    for k, v in state.items():
+        if k.startswith("module."):
+            k = k[len("module."):]
+        cleaned[k] = v
+    info = model.load_state_dict(cleaned, strict=False)
+    print(
+        f"[load] missing={len(info.missing_keys)} "
+        f"unexpected={len(info.unexpected_keys)}"
+    )
+    return model
+
+
+def _collect_for_dataset(cfg, kind):
+    """Build a Collect-aware val transform list appropriate for the
+    chosen dataset."""
+    common = (
+        "coord", "grid_coord", "caption", "positive_map",
+        "primary_object_id", "scene_id", "name",
+    )
+    pre = [
+        dict(
+            type="GridSample",
+            grid_size=0.02,
+            hash_type="fnv",
+            mode="train",
+            return_grid_coord=True,
+        ),
+        dict(type="NormalizeColor"),
+        dict(type="ToTensor"),
+    ]
+    if kind == "arkitscenes":
+        return pre + [
+            dict(
+                type="Collect",
+                keys=common + ("boxes_xyzxyz",),
+                feat_keys=("coord", "color", "normal"),
+            )
+        ]
+    else:
+        return pre + [
+            dict(
+                type="Collect",
+                keys=common + ("instance",),
+                feat_keys=("coord", "color", "normal"),
+            )
+        ]
+
+
+def _build_dataset(args, cfg):
+    kind = args.dataset
+    if kind == "arkitscenes":
+        ann = args.annotation_file or getattr(
+            cfg, "arkit_val_ann",
+            "locate-3d/locate3d_data/val_arkitscenes.json",
+        )
+        root = args.data_root or getattr(
+            cfg, "arkit_root",
+            "/group-volume/3Ddataset/arkitscenes-compressed",
+        )
+        transform = _collect_for_dataset(cfg, "arkitscenes")
+        return ARKitScenesLocate3DDataset(
+            annotation_file=ann,
+            data_root=root,
+            transform=transform,
+            test_mode=True,
+            loop=1,
+        )
+    elif kind == "scannet":
+        ann = args.annotation_file or getattr(
+            cfg, "scannet_val_ann",
+            "locate-3d/locate3d_data/val_scannet.json",
+        )
+        root = args.data_root or getattr(
+            cfg, "scannet_root",
+            "/group-volume/3Ddataset/scannet-compressed",
+        )
+        transform = _collect_for_dataset(cfg, "scannet")
+        return ScanNetLocate3DDataset(
+            annotation_file=ann,
+            data_root=root,
+            transform=transform,
+            test_mode=True,
+            loop=1,
+        )
+    elif kind == "scannetpp":
+        ann = args.annotation_file or getattr(
+            cfg, "scannetpp_val_ann",
+            "locate-3d/locate3d_data/val_scannetpp.json",
+        )
+        root = args.data_root or getattr(
+            cfg, "scannetpp_root",
+            "/group-volume/3Ddataset/scannetpp-compressed",
+        )
+        transform = _collect_for_dataset(cfg, "scannetpp")
+        return ScanNetPPLocate3DDataset(
+            annotation_file=ann,
+            data_root=root,
+            transform=transform,
+            test_mode=True,
+            loop=1,
+        )
+    else:
+        raise ValueError(f"unknown --dataset {kind!r}")
+
+
+def _pick_indices(dataset, num_scenes, scene_ids_filter=None):
+    """Select at most ``num_scenes`` sample indices, preferring distinct
+    scene_ids and respecting an optional scene_id filter."""
+    anns = dataset.anns
+    if scene_ids_filter:
+        wanted = set(scene_ids_filter)
+        chosen = [i for i, a in enumerate(anns) if a["scene_id"] in wanted]
+        return chosen[:num_scenes]
+    chosen = []
+    seen = set()
+    for i, a in enumerate(anns):
+        if a["scene_id"] in seen:
+            continue
+        seen.add(a["scene_id"])
+        chosen.append(i)
+        if len(chosen) >= num_scenes:
+            break
+    if len(chosen) < num_scenes:
+        rest = [i for i in range(len(anns)) if i not in chosen]
+        chosen.extend(rest[: num_scenes - len(chosen)])
+    return chosen
+
+
+def _get_color_from_feat(feat_tensor):
+    """``feat_keys=(coord, color, normal)`` → feat is (N, 9). Color is
+    the middle 3 channels."""
+    arr = feat_tensor.float().cpu().numpy()
+    if arr.shape[1] >= 6:
+        return arr[:, 3:6]
+    return np.full((arr.shape[0], 3), 0.5, dtype=np.float32)
 
 
 def _sample_to_gpu(batch):
