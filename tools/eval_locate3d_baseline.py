@@ -291,9 +291,12 @@ def main():
         try:
             data = dataset[idx]
         except AssertionError as e:
-            # Meta's Locate3DDataset asserts on missing featurized cache:
-            # ``"Must first run preprocessing..."``. Rebuild the exact
-            # path it looked for so the error is actionable.
+            # Meta's Locate3DDataset raises AssertionError for at least
+            # three different reasons: (a) missing featurized cache file,
+            # (b) the dataset's --*-data-dir wasn't provided so the raw
+            # scan loader is None, (c) the scene_id isn't in the raw
+            # scan index. Probe the filesystem to disambiguate instead
+            # of guessing.
             ann = annos[idx]
             sid = ann.get("scene_id")
             sds = ann.get("scene_dataset", "ScanNet")
@@ -303,10 +306,38 @@ def main():
             else:
                 fname = f"{sid}.pt"
             expected = os.path.join(args.cache_path, sds, fname)
+            exists = os.path.exists(expected)
+            isfile = os.path.isfile(expected)
+            readable = os.access(expected, os.R_OK)
+            try:
+                size = os.path.getsize(expected) if exists else None
+            except OSError:
+                size = None
             n_missing_cache += 1
             if len(missing_cache_examples) < 3:
                 missing_cache_examples.append(expected)
-                print(f"[skip] sample {idx} ({sid}): cache file not found at {expected}")
+                print(f"[skip] sample {idx} ({sid}): AssertionError: {e}")
+                print(f"        expected cache: {expected}")
+                print(f"        exists={exists} isfile={isfile} "
+                      f"readable={readable} size={size}")
+                if exists and not readable:
+                    print("        -> file exists but the current user "
+                          "lacks read permission (chmod / chown).")
+                elif not exists:
+                    parent = os.path.dirname(expected)
+                    if os.path.isdir(parent):
+                        try:
+                            sample_listing = sorted(os.listdir(parent))[:5]
+                        except PermissionError:
+                            sample_listing = ["<no listdir permission>"]
+                        print(f"        parent dir {parent} exists; "
+                              f"sample contents: {sample_listing}")
+                        print("        -> filename mismatch. Compare to "
+                              f"the ones above; expected ``{fname}``.")
+                    else:
+                        print(f"        parent dir {parent} does NOT exist.")
+                        print("        -> --cache-path or scene_dataset "
+                              "subdir wrong.")
             continue
         except Exception as e:
             print(f"[skip] sample {idx} ({annos[idx].get('scene_id')}): "
