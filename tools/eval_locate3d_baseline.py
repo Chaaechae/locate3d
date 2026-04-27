@@ -245,6 +245,15 @@ def main():
                          "ScanNet / ScanNet++ GT boxes are themselves "
                          "AABBs of per-point instance masks, so mask_aabb "
                          "is the apples-to-apples comparison there.")
+    ap.add_argument("--matcher", default="post_process",
+                    choices=("post_process", "raw_logits"),
+                    help="post_process: use the sigmoid>0.5 filtered "
+                         "instances list (Meta's _post_process_sigmoid_"
+                         "loss_prediction). raw_logits: bypass the filter "
+                         "and pick, for each entity, the query with the "
+                         "highest mean sigmoid(logit) at the entity's "
+                         "CLIP token positions. Recovers good queries "
+                         "whose top-1 token logit happens to land below 0.5.")
     ap.add_argument("--output", default=None,
                     help="optional path to write per-sample + summary JSON")
     args = ap.parse_args()
@@ -464,28 +473,63 @@ def main():
         }
         try:
             with torch.no_grad():
-                instances = model.inference(psp_cuda, utterance)
+                if args.matcher == "raw_logits":
+                    # Bypass _post_process_sigmoid_loss_prediction --
+                    # call the model directly so we keep all 256
+                    # queries' raw scores instead of throwing away the
+                    # ones whose top token logit is below 0.5.
+                    raw = model(psp_cuda, utterance)
+                    instances = None  # not used in this mode
+                else:
+                    raw = None
+                    instances = model.inference(psp_cuda, utterance)
         except Exception as e:
             print(f"[skip] inference failed for sample {idx}: "
                   f"{type(e).__name__}: {e}")
             continue
 
-        # For each entity, find the predicted instance with maximal CLIP-
-        # token overlap (strictly > 0). Tie-break by confidence.
-        per_entity_best = {}  # oid -> (instance_idx, overlap, confidence)
-        for oid in oids:
-            target_clip_tokens = clip_tokens_per_oid[oid]
-            best = (None, -1, -1.0)
-            if not target_clip_tokens:
+        per_entity_best = {}  # oid -> (instance_idx OR query_idx, overlap_or_score, confidence)
+        if args.matcher == "raw_logits":
+            # raw["pred_logits"]: (B=1, Q, T)
+            # raw["pred_masks"]: (B=1, Q, N)
+            # raw["pred_boxes"]: (B=1, Q, 6)
+            logits = raw["pred_logits"][0]               # (Q, T)
+            masks_all = raw["pred_masks"][0]              # (Q, N)
+            boxes_all = raw["pred_boxes"][0]              # (Q, 6)
+            sig = torch.sigmoid(logits)                   # (Q, T)
+            for oid in oids:
+                target = clip_tokens_per_oid[oid]
+                if not target:
+                    per_entity_best[oid] = (None, -1, -1.0)
+                    continue
+                target_idx = torch.tensor(
+                    sorted(t for t in target if t < sig.shape[1]),
+                    device=sig.device, dtype=torch.long,
+                )
+                if target_idx.numel() == 0:
+                    per_entity_best[oid] = (None, -1, -1.0)
+                    continue
+                # Per-query score: mean sigmoid logit over the entity's
+                # CLIP token positions. Highest = most aligned to entity.
+                scores = sig[:, target_idx].mean(dim=1)   # (Q,)
+                qi = int(scores.argmax().item())
+                per_entity_best[oid] = (qi, len(target), float(scores[qi].item()))
+        else:
+            # Standard post-processed instances list. Pick by max CLIP-
+            # token overlap (tie-break by confidence).
+            for oid in oids:
+                target_clip_tokens = clip_tokens_per_oid[oid]
+                best = (None, -1, -1.0)
+                if not target_clip_tokens:
+                    per_entity_best[oid] = best
+                    continue
+                for ii, inst in enumerate(instances):
+                    pred_clip_tokens = set(int(t) for t in inst["tokens_assigned"])
+                    overlap = len(target_clip_tokens & pred_clip_tokens)
+                    conf = float(inst.get("confidence", 0.0))
+                    if overlap > best[1] or (overlap == best[1] and conf > best[2]):
+                        best = (ii, overlap, conf)
                 per_entity_best[oid] = best
-                continue
-            for ii, inst in enumerate(instances):
-                pred_clip_tokens = set(int(t) for t in inst["tokens_assigned"])
-                overlap = len(target_clip_tokens & pred_clip_tokens)
-                conf = float(inst.get("confidence", 0.0))
-                if overlap > best[1] or (overlap == best[1] and conf > best[2]):
-                    best = (ii, overlap, conf)
-            per_entity_best[oid] = best
 
         # Compute IoU for primary + all entities
         per_entity_record = []
@@ -496,25 +540,25 @@ def main():
             best_ii, best_overlap, best_conf = per_entity_best[oid]
             iou = 0.0
             if gt_box is not None and best_ii is not None and best_overlap > 0:
-                inst = instances[best_ii]
+                # Pull bbox + mask either from the post-processed
+                # instances list or from the raw decoder output,
+                # depending on the matcher mode.
+                if args.matcher == "raw_logits":
+                    bbox_t = boxes_all[best_ii]
+                    mask_t = torch.sigmoid(masks_all[best_ii])
+                else:
+                    inst = instances[best_ii]
+                    bbox_t = inst["bbox"]
+                    mask_t = inst.get("mask", None)
                 if args.box_source == "mask_aabb":
-                    # Derive predicted box from per-point sigmoid mask:
-                    # AABB over points whose mask score exceeds threshold.
-                    # Same construction Meta uses for ScanNet GT boxes
-                    # (AABB of instance-mask points), so this is the
-                    # apples-to-apples comparison.
-                    mask = inst.get("mask")
-                    if mask is None:
+                    if mask_t is None:
                         pred_xyzxyz = None
                     else:
-                        m = mask.detach().cpu().numpy().reshape(-1)
+                        m = mask_t.detach().cpu().numpy().reshape(-1)
                         pts = data["featurized_sensor_pointcloud"]["points"]
                         pts_np = (pts.cpu().numpy()
                                   if torch.is_tensor(pts)
                                   else np.asarray(pts))
-                        # Mask is over the encoder's input points (same N
-                        # as we ran inference on). Align by truncating to
-                        # the shorter of the two.
                         n_align = min(m.shape[0], pts_np.shape[0])
                         sel = m[:n_align] > args.mask_threshold
                         if sel.sum() == 0:
@@ -525,7 +569,7 @@ def main():
                                 [mp.min(0), mp.max(0)]
                             ).astype(np.float32)
                 else:
-                    pred_bbox = inst["bbox"].detach().cpu().numpy()
+                    pred_bbox = bbox_t.detach().cpu().numpy()
                     pred_xyzxyz = _xyzxyz_from_anything(pred_bbox)
                 if pred_xyzxyz is not None:
                     iou = _iou_3d_xyzxyz(pred_xyzxyz, gt_box)
@@ -544,12 +588,14 @@ def main():
                     if iou >= t:
                         hits_primary[t] += 1
 
+        n_pred = len(instances) if instances is not None \
+            else int(boxes_all.shape[0])
         per_sample_records.append(dict(
             scene_id=ann.get("scene_id"),
             ann_id=ann.get("ann_id"),
             primary_oid=int(primary_oid),
             entities=per_entity_record,
-            n_pred_instances=len(instances),
+            n_pred_instances=n_pred,
         ))
 
         # First few samples: dump everything we need to diagnose
@@ -562,7 +608,10 @@ def main():
                 gt_b = gt_boxes_xyzxyz[gt_idx]
                 pred_b = None
                 if ii is not None:
-                    pb = instances[ii]["bbox"].detach().cpu().numpy()
+                    if args.matcher == "raw_logits":
+                        pb = boxes_all[ii].detach().cpu().numpy()
+                    else:
+                        pb = instances[ii]["bbox"].detach().cpu().numpy()
                     pred_b = _xyzxyz_from_anything(pb).round(2).tolist()
                 ent_dbg.append({
                     "oid": int(oid),
