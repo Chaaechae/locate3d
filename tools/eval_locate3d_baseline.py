@@ -629,7 +629,7 @@ def main():
             if set(oids) != set(ann.get("object_ids") or []):
                 print(f"        *** OID SET MISMATCH between our resolver "
                       f"and Meta's add_positive_map_and_obj_ids ***")
-            print(f"        n_instances={len(instances)} oids={oids}")
+            print(f"        n_instances={n_pred} oids={oids}")
             la_keys = list(data.get("lang_data", {}).keys())
             la_gt = data.get("lang_data", {}).get("gt_boxes")
             la_gt_shape = (None if la_gt is None else
