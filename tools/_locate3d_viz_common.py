@@ -75,7 +75,18 @@ def _render_scene(
     draw_boxes=True,
     scene_point_size=2.2,
     scene_opacity=0.9,
+    mask_coord=None,
 ):
+    """Plotly render of a 3D scene with GT / Pred boxes and optional
+    per-entity mask overlay.
+
+    ``coord`` / ``color`` are the *background* point cloud. When
+    ``mask_coord`` is provided, the per-entity ``pred_logits`` are
+    interpreted as scoring those points (e.g. the cache's downsampled
+    points the model actually ran on) and rendered on top of the
+    background. When ``mask_coord`` is None, ``pred_logits`` is
+    expected to align with ``coord`` itself (pre-existing behavior).
+    """
     try:
         import plotly.graph_objects as go
     except ImportError as e:
@@ -94,10 +105,19 @@ def _render_scene(
         idx = np.arange(N)
     c_sub = coord[idx]
     col_sub = color[idx]
-    if pred_logits is not None and pred_logits.shape[1] == N:
-        logit_sub = pred_logits[:, idx]
+
+    # Mask overlay coordinates. If a separate mask_coord was provided
+    # (the points the model actually ran inference on), keep the full
+    # set -- they're already small (~30k). Otherwise reuse c_sub.
+    if mask_coord is not None:
+        mask_coord_arr = np.asarray(mask_coord, dtype=np.float32)
+        logit_for_mask = pred_logits   # logits already align with mask_coord
     else:
-        logit_sub = None
+        mask_coord_arr = c_sub
+        if pred_logits is not None and pred_logits.shape[1] == N:
+            logit_for_mask = pred_logits[:, idx]
+        else:
+            logit_for_mask = None
 
     rgb_str = [
         f"rgb({int(r * 255)},{int(g * 255)},{int(b * 255)})"
@@ -179,11 +199,12 @@ def _render_scene(
                 )
             )
 
-        if draw_masks and logit_sub is not None and g < logit_sub.shape[0]:
-            prob_g = 1.0 / (1.0 + np.exp(-logit_sub[g]))
+        if (draw_masks and logit_for_mask is not None
+                and g < logit_for_mask.shape[0]):
+            prob_g = 1.0 / (1.0 + np.exp(-logit_for_mask[g]))
             mask_g = prob_g > infer_threshold
             if mask_g.any():
-                mask_pts = c_sub[mask_g]
+                mask_pts = mask_coord_arr[mask_g]
                 fig.add_trace(
                     go.Scatter3d(
                         x=mask_pts[:, 0], y=mask_pts[:, 1], z=mask_pts[:, 2],

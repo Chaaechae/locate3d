@@ -171,8 +171,16 @@ def main():
                          "(higher = scene more visible)")
     ap.add_argument("--scene-opacity", type=float, default=0.9,
                     help="opacity for scene RGB cloud (0..1)")
+    ap.add_argument("--scene-source", default="mesh",
+                    choices=("mesh", "cache"),
+                    help="mesh: render the full scene mesh point cloud "
+                         "loaded by Meta's ScanNet/ScanNetPP/ARKit "
+                         "dataset (1-2M pts; gives a clear visual of "
+                         "the room). cache: render only the ~30k points "
+                         "the model actually saw (faster, looser scene).")
     ap.add_argument("--scene-max-points", type=int, default=120000,
-                    help="cap rendered scene point count")
+                    help="cap rendered scene point count (mesh has "
+                         "1-2M pts so we subsample down to this)")
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -307,12 +315,36 @@ def main():
                 if 0 <= wi < len(caption_words):
                     word_color_map[wi] = color
 
-        # Use the points the model actually saw.
-        coord = psp_cpu["points"].numpy()
-        if "rgb" in psp_cpu and torch.is_tensor(psp_cpu["rgb"]):
-            color = psp_cpu["rgb"].numpy()
+        # Background: full mesh xyz/rgb (clear scene visual) or the
+        # cache's subsampled points (faster, smaller). Mask overlay is
+        # ALWAYS the cache points since per-point logits live there.
+        cache_coord = psp_cpu["points"].numpy()
+        if args.scene_source == "mesh" and "mesh" in data:
+            mxyz = data["mesh"].get("xyz")
+            mrgb = data["mesh"].get("rgb")
+            if mxyz is None:
+                bg_coord = cache_coord
+                bg_color = (psp_cpu["rgb"].numpy()
+                            if "rgb" in psp_cpu and torch.is_tensor(psp_cpu["rgb"])
+                            else np.full_like(cache_coord, 0.5))
+                mask_coord_arg = None
+            else:
+                bg_coord = (mxyz.cpu().numpy() if torch.is_tensor(mxyz)
+                            else np.asarray(mxyz))
+                if mrgb is None:
+                    bg_color = np.full_like(bg_coord, 0.5)
+                else:
+                    bg_color = (mrgb.cpu().numpy() if torch.is_tensor(mrgb)
+                                else np.asarray(mrgb))
+                # Mask overlay lives in cache-point space, separate
+                # from the mesh background.
+                mask_coord_arg = cache_coord
         else:
-            color = np.full_like(coord, 0.5)
+            bg_coord = cache_coord
+            bg_color = (psp_cpu["rgb"].numpy()
+                        if "rgb" in psp_cpu and torch.is_tensor(psp_cpu["rgb"])
+                        else np.full_like(cache_coord, 0.5))
+            mask_coord_arg = None
 
         out_html = os.path.join(
             args.output_dir,
@@ -322,11 +354,12 @@ def main():
         draw_masks = args.pred_mode in ("point", "both")
         _render_scene(
             out_path=out_html,
-            coord=coord,
-            color=color,
+            coord=bg_coord,
+            color=bg_color,
             gt_boxes=gt_box_list,
             pred_boxes=pred_box_list,
             pred_logits=pred_logits if draw_masks else None,
+            mask_coord=mask_coord_arg,
             infer_threshold=args.mask_threshold,
             caption=utterance,
             scene_id=str(ann.get("scene_id")),
