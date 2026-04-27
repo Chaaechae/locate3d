@@ -225,6 +225,14 @@ def main():
         help="sigmoid(score) threshold for mask visualization",
     )
     ap.add_argument("--no-mask", action="store_true", help="skip mask overlay")
+    ap.add_argument("--no-box", action="store_true",
+                    help="skip GT/Pred box rendering (point-only mode)")
+    ap.add_argument("--scene-point-size", type=float, default=2.2,
+                    help="plotly marker size for the scene RGB cloud")
+    ap.add_argument("--scene-opacity", type=float, default=0.9,
+                    help="opacity for scene RGB cloud (0..1)")
+    ap.add_argument("--scene-max-points", type=int, default=120000,
+                    help="cap rendered scene point count")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -340,6 +348,10 @@ def main():
             caption_token_colormap=cap_colormap,
             caption_word_list=cap_words,
             draw_masks=not args.no_mask,
+            draw_boxes=not args.no_box,
+            scene_point_size=args.scene_point_size,
+            scene_opacity=args.scene_opacity,
+            max_points=args.scene_max_points,
         )
 
         del out, batch, batch_gpu

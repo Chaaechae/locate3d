@@ -71,7 +71,10 @@ def _render_scene(
     entity_tokens=None,
     caption_token_colormap=None,
     caption_word_list=None,
-    max_points=60000, draw_masks=True,
+    max_points=120000, draw_masks=True,
+    draw_boxes=True,
+    scene_point_size=2.2,
+    scene_opacity=0.9,
 ):
     try:
         import plotly.graph_objects as go
@@ -106,7 +109,11 @@ def _render_scene(
         go.Scatter3d(
             x=c_sub[:, 0], y=c_sub[:, 1], z=c_sub[:, 2],
             mode="markers",
-            marker=dict(size=1.2, color=rgb_str, opacity=0.6),
+            marker=dict(
+                size=scene_point_size,
+                color=rgb_str,
+                opacity=scene_opacity,
+            ),
             name="scene",
             showlegend=False,
             hoverinfo="skip",
@@ -129,7 +136,7 @@ def _render_scene(
         is_primary = g == primary_idx
         suffix = " (primary)" if is_primary else ""
 
-        if g < len(gt_boxes):
+        if draw_boxes and g < len(gt_boxes):
             xs, ys, zs = _box_edges(gt_boxes[g])
             fig.add_trace(
                 go.Scatter3d(
@@ -158,7 +165,7 @@ def _render_scene(
                     hoverinfo="skip",
                 )
             )
-        if g < len(pred_boxes):
+        if draw_boxes and g < len(pred_boxes):
             xs, ys, zs = _box_edges(pred_boxes[g])
             fig.add_trace(
                 go.Scatter3d(
@@ -182,11 +189,13 @@ def _render_scene(
                         x=mask_pts[:, 0], y=mask_pts[:, 1], z=mask_pts[:, 2],
                         mode="markers",
                         marker=dict(
-                            size=3 if is_primary else 2,
+                            size=5 if is_primary else 4,
                             color=pred_color,
-                            opacity=0.9,
+                            opacity=1.0,
+                            line=dict(color="black", width=0.3),
                         ),
-                        name=f"Mask {name}{suffix}",
+                        name=f"Pred points: {name}{suffix}",
+                        legendgroup=f"e{g}",
                         hoverinfo="skip",
                     )
                 )

@@ -160,8 +160,19 @@ def main():
                          "scenes if --scene-ids is not given")
     ap.add_argument("--downsample-pts", type=int, default=30000)
     ap.add_argument("--output-dir", default="viz_baseline/")
-    ap.add_argument("--draw-masks", action="store_true",
-                    help="overlay per-entity sigmoid > 0.5 mask points")
+    ap.add_argument("--pred-mode", default="both",
+                    choices=("box", "point", "both"),
+                    help="box: only AABB. point: only mask points "
+                         "(sigmoid > --mask-threshold). both: AABB + "
+                         "mask points overlaid.")
+    ap.add_argument("--mask-threshold", type=float, default=0.5)
+    ap.add_argument("--scene-point-size", type=float, default=2.2,
+                    help="plotly marker size for the scene RGB cloud "
+                         "(higher = scene more visible)")
+    ap.add_argument("--scene-opacity", type=float, default=0.9,
+                    help="opacity for scene RGB cloud (0..1)")
+    ap.add_argument("--scene-max-points", type=int, default=120000,
+                    help="cap rendered scene point count")
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -242,25 +253,50 @@ def main():
             instances, oids, clip_tokens_per_oid
         )
 
-        # Build per-entity arrays in oids order.
+        # Build per-entity arrays in oids order. Also build per-entity
+        # mask logits aligned to the input points so the renderer can
+        # draw the points where ``sigmoid(logit) > infer_threshold``.
         gt_box_list = []
         pred_box_list = []
         entity_names = []
         entity_tokens = []
+        per_entity_mask_logits = []  # list of (N,) numpy or None per oid
+        N_pts = psp_cpu["points"].shape[0]
         for oid in oids:
             gb = gt_boxes[oids.index(oid)]
-            pb, _ii = per_oid[oid]
+            pb, ii = per_oid[oid]
             if gb is not None:
                 gt_box_list.append(gb)
             if pb is not None:
                 pred_box_list.append(pb)
-            # cosmetic name = oid_label words
             words = [
                 ann["token"][wi] for wi in sorted(tokens_per_oid.get(oid, set()))
                 if wi < len(ann.get("token", []))
             ]
             entity_names.append(f"oid_{oid}")
             entity_tokens.append(words)
+
+            # Build the per-entity logit row.
+            if ii is None:
+                per_entity_mask_logits.append(np.full(N_pts, -10.0,
+                                                      dtype=np.float32))
+                continue
+            mask = instances[ii].get("mask")
+            if mask is None:
+                per_entity_mask_logits.append(np.full(N_pts, -10.0,
+                                                      dtype=np.float32))
+                continue
+            # Meta returns mask already passed through sigmoid. The
+            # renderer expects logits and re-applies sigmoid; convert
+            # back via logit transform with epsilon clip.
+            m_np = mask.detach().cpu().numpy().reshape(-1).astype(np.float32)
+            n_align = min(m_np.shape[0], N_pts)
+            row = np.full(N_pts, -10.0, dtype=np.float32)
+            p = np.clip(m_np[:n_align], 1e-6, 1.0 - 1e-6)
+            row[:n_align] = np.log(p / (1.0 - p))
+            per_entity_mask_logits.append(row)
+        pred_logits = np.stack(per_entity_mask_logits, axis=0) \
+            if per_entity_mask_logits else None
 
         # Caption coloring: word index → vivid pred palette color.
         caption_words = list(ann.get("token", []))
@@ -282,14 +318,16 @@ def main():
             args.output_dir,
             f"baseline_{ann.get('scene_id')}_ann{ann.get('ann_id')}.html",
         )
+        draw_boxes = args.pred_mode in ("box", "both")
+        draw_masks = args.pred_mode in ("point", "both")
         _render_scene(
             out_path=out_html,
             coord=coord,
             color=color,
             gt_boxes=gt_box_list,
             pred_boxes=pred_box_list,
-            pred_logits=None,           # baseline: skip per-point mask overlay
-            infer_threshold=0.5,
+            pred_logits=pred_logits if draw_masks else None,
+            infer_threshold=args.mask_threshold,
             caption=utterance,
             scene_id=str(ann.get("scene_id")),
             primary_idx=0,
@@ -297,7 +335,11 @@ def main():
             entity_tokens=entity_tokens,
             caption_token_colormap=word_color_map,
             caption_word_list=caption_words,
-            draw_masks=args.draw_masks,
+            draw_masks=draw_masks,
+            draw_boxes=draw_boxes,
+            scene_point_size=args.scene_point_size,
+            scene_opacity=args.scene_opacity,
+            max_points=args.scene_max_points,
         )
 
     print(f"[done] HTMLs under {args.output_dir}")
