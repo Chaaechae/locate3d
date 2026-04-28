@@ -172,6 +172,11 @@ class Trainer(TrainerBase):
                     self.train_loader.sampler.set_epoch(self.epoch)
                 self.model.train()
                 self.data_iterator = enumerate(self.train_loader)
+                # iter_per_epoch needs to be set BEFORE the OOM logger
+                # uses it; ConfigureMisc / pre-existing setters do this
+                # in before_train, but mid-epoch re-entry can leave the
+                # value stale. Refresh defensively here.
+                self.comm_info["iter_per_epoch"] = len(self.train_loader)
                 self.before_epoch()
                 # => run_epoch
                 for (
@@ -184,18 +189,44 @@ class Trainer(TrainerBase):
                     if oom_skip_batch:
                         try:
                             self.run_step()
+                            oom_local = 0
                         except torch.cuda.OutOfMemoryError as e:
                             self._handle_oom(e)
-                            continue
+                            oom_local = 1
                         except RuntimeError as e:
-                            # Some allocator failures surface as plain
-                            # RuntimeError ("CUDA error: out of memory",
-                            # cuBLAS/cuDNN handle alloc failures, etc.).
                             msg = str(e).lower()
                             if "out of memory" in msg or "cuda error" in msg:
                                 self._handle_oom(e)
-                                continue
-                            raise
+                                oom_local = 1
+                            else:
+                                raise
+                        # DDP-safe OOM coordination. If ANY rank skipped
+                        # the batch, ALL ranks must also skip the
+                        # subsequent optimizer.step / DDP all_reduce
+                        # cycle, otherwise the reducer state goes out of
+                        # sync ("Expected to have finished reduction in
+                        # the prior iteration"). One rank doing
+                        # `continue` while others did backward is the
+                        # exact trigger.
+                        if comm.get_world_size() > 1:
+                            flag = torch.tensor(
+                                [oom_local], dtype=torch.int32, device="cuda"
+                            )
+                            torch.distributed.all_reduce(
+                                flag, op=torch.distributed.ReduceOp.MAX
+                            )
+                            global_oom = int(flag.item())
+                        else:
+                            global_oom = oom_local
+                        if global_oom:
+                            # Force every rank into a clean state, even
+                            # the ones that ran successfully -- their
+                            # backward populated grads + DDP buckets,
+                            # which would clash with the OOM rank's
+                            # zeroed state on the next iter.
+                            if oom_local == 0:
+                                self._handle_oom_remote()
+                            continue
                     else:
                         self.run_step()
                     # => after_step
@@ -206,32 +237,80 @@ class Trainer(TrainerBase):
             self.after_train()
 
     def _handle_oom(self, exc):
-        """Free GPU memory and log a skip line so an OOM-killed batch
-        doesn't terminate the run."""
+        """Free GPU memory + log diagnostics. Called on the rank that
+        actually raised the OOM."""
         # Drop references that may pin GPU memory.
-        self.comm_info.pop("input_dict", None)
+        input_dict = self.comm_info.pop("input_dict", None)
         self.comm_info.pop("model_output_dict", None)
-        # Zero grads in case backward partially populated them before
-        # OOM -- otherwise the next optimizer step would apply stale
-        # garbage.
         try:
             self.optimizer.zero_grad(set_to_none=True)
         except Exception:
             pass
-        # Reset gradient-accumulation counter so the next batch starts
-        # a fresh accumulation window.
         self._gradient_accumulation_counter = 0
-        # Free cached blocks so the allocator can defragment.
+
+        # Log scene-level info BEFORE empty_cache (the input batch is
+        # what's most useful for diagnosing which sample blew up).
+        diag = []
+        if isinstance(input_dict, dict):
+            for key in ("scene_id", "name", "caption"):
+                v = input_dict.get(key)
+                if isinstance(v, list) and v:
+                    diag.append(f"{key}={v[0]!r}")
+                elif v is not None:
+                    diag.append(f"{key}={v!r}")
+            for key in ("coord", "feat"):
+                t = input_dict.get(key)
+                if hasattr(t, "shape"):
+                    diag.append(f"{key}.shape={tuple(t.shape)}")
+            if "offset" in input_dict and hasattr(input_dict["offset"], "tolist"):
+                diag.append(f"offset={input_dict['offset'].tolist()}")
+        # GPU memory snapshot (pre-empty-cache so we see the actual peak).
+        try:
+            allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+            reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+            peak = torch.cuda.max_memory_allocated() / (1024 ** 3)
+            diag.append(
+                f"mem alloc={allocated:.2f}GB reserved={reserved:.2f}GB "
+                f"peak={peak:.2f}GB"
+            )
+        except Exception:
+            pass
+
         torch.cuda.empty_cache()
         try:
             torch.cuda.synchronize()
         except Exception:
             pass
+        torch.cuda.reset_peak_memory_stats()
+
         ipe = self.comm_info.get("iter_per_epoch", 0)
         it = self.comm_info.get("iter", -1)
+        rank = comm.get_rank() if comm.get_world_size() > 1 else 0
+        self._oom_count = getattr(self, "_oom_count", 0) + 1
         self.logger.warning(
-            f"[oom-skip] OOM at epoch {self.epoch} iter {it}/{ipe}: "
-            f"{type(exc).__name__}: {exc}. Skipping batch."
+            f"[oom-skip] rank={rank} epoch={self.epoch} iter={it}/{ipe} "
+            f"oom_count={self._oom_count} {type(exc).__name__}: {exc} "
+            f"|| {' '.join(diag)}"
+        )
+
+    def _handle_oom_remote(self):
+        """Mirror _handle_oom on a rank that did NOT itself OOM but
+        must abort the current step because some other rank did. Drops
+        gradients populated by this rank's successful backward so DDP's
+        bucket state matches the OOM rank's zeroed state."""
+        self.comm_info.pop("input_dict", None)
+        self.comm_info.pop("model_output_dict", None)
+        try:
+            self.optimizer.zero_grad(set_to_none=True)
+        except Exception:
+            pass
+        self._gradient_accumulation_counter = 0
+        torch.cuda.empty_cache()
+        rank = comm.get_rank() if comm.get_world_size() > 1 else 0
+        self.logger.warning(
+            f"[oom-skip] rank={rank} epoch={self.epoch} "
+            f"iter={self.comm_info.get('iter', -1)}: "
+            f"peer rank OOM-aborted; matching skip on this rank."
         )
 
     def run_step(self):
