@@ -185,6 +185,19 @@ class Trainer(TrainerBase):
                 ) in self.data_iterator:
                     # => before_step
                     self.before_step()
+
+                    # Imbalance probe: log per-rank input point count
+                    # every ``rank_probe_every`` iters so we can see
+                    # which rank is getting big/small scenes WITHOUT
+                    # waiting for an OOM. Crash diagnostics from inside
+                    # _handle_oom only fire on failure -- this fires
+                    # proactively. Disable with ``rank_probe_every=0``.
+                    rank_probe_every = getattr(
+                        self.cfg, "rank_probe_every", 50
+                    )
+                    if (rank_probe_every > 0
+                            and self.comm_info["iter"] % rank_probe_every == 0):
+                        self._log_rank_imbalance()
                     # => run_step (OOM-resilient)
                     if oom_skip_batch:
                         try:
@@ -342,6 +355,66 @@ class Trainer(TrainerBase):
             f"iter={self.comm_info.get('iter', -1)}: "
             f"peer rank OOM-aborted; matching skip on this rank."
         )
+
+    def _log_rank_imbalance(self):
+        """Emit a per-rank line showing how many points this rank's
+        current batch contains. After a few prints the imbalance
+        pattern (one rank with 5x point count of the others) becomes
+        obvious. Enabled by cfg.rank_probe_every (default 50)."""
+        input_dict = self.comm_info.get("input_dict", None)
+        if not isinstance(input_dict, dict):
+            return
+        coord = input_dict.get("coord", None)
+        if not hasattr(coord, "shape"):
+            return
+        n_pts = int(coord.shape[0])
+        offset = input_dict.get("offset", None)
+        per_sample = ""
+        if hasattr(offset, "tolist"):
+            o = offset.tolist()
+            sizes = [o[0]] + [o[i] - o[i - 1] for i in range(1, len(o))]
+            per_sample = f" per_sample={sizes}"
+        scene_id = ""
+        sids = input_dict.get("scene_id", None)
+        if isinstance(sids, list) and sids:
+            scene_id = f" scenes={sids}"
+        elif isinstance(sids, str):
+            scene_id = f" scene={sids}"
+
+        rank = comm.get_rank() if comm.get_world_size() > 1 else 0
+        ws = comm.get_world_size()
+        # Coordinate the print across ranks: gather all rank counts so
+        # one line shows the whole batch's spread.
+        if ws > 1:
+            try:
+                t = torch.tensor([n_pts], dtype=torch.long, device="cuda")
+                gathered = [
+                    torch.zeros_like(t) for _ in range(ws)
+                ]
+                torch.distributed.all_gather(gathered, t)
+                all_counts = [int(x.item()) for x in gathered]
+                if rank == 0:
+                    spread = max(all_counts) / max(min(all_counts), 1)
+                    self.logger.info(
+                        f"[rank-probe] iter={self.comm_info['iter']} "
+                        f"per_rank_n_pts={all_counts} "
+                        f"max/min={spread:.1f}x"
+                    )
+                # Always print the rank-local detail (scene_ids etc.)
+                self.logger.info(
+                    f"[rank-probe] rank={rank} n_pts={n_pts}"
+                    f"{per_sample}{scene_id}"
+                )
+            except Exception as e:
+                self.logger.info(
+                    f"[rank-probe] rank={rank} n_pts={n_pts}"
+                    f"{per_sample}{scene_id} (gather failed: {e})"
+                )
+        else:
+            self.logger.info(
+                f"[rank-probe] rank={rank} n_pts={n_pts}"
+                f"{per_sample}{scene_id}"
+            )
 
     def run_step(self):
         if version.parse(torch.__version__) >= version.parse("2.4"):
