@@ -160,6 +160,12 @@ class Trainer(TrainerBase):
             # => before train
             self.before_train()
             self.logger.info(">>>>>>>>>>>>>>>> Start Training >>>>>>>>>>>>>>>>")
+            # Per-step OOM resilience: catch CUDA OOM (and certain
+            # spurious cuBLAS/cuDNN failures), free memory, skip the
+            # offending batch, and keep training. Disable by setting
+            # ``cfg.oom_skip_batch=False`` if the deterministic-crash
+            # behavior is preferred (e.g. for debugging).
+            oom_skip_batch = getattr(self.cfg, "oom_skip_batch", True)
             for self.epoch in range(self.start_epoch, self.max_epoch):
                 # => before epoch
                 if comm.get_world_size() > 1:
@@ -174,14 +180,59 @@ class Trainer(TrainerBase):
                 ) in self.data_iterator:
                     # => before_step
                     self.before_step()
-                    # => run_step
-                    self.run_step()
+                    # => run_step (OOM-resilient)
+                    if oom_skip_batch:
+                        try:
+                            self.run_step()
+                        except torch.cuda.OutOfMemoryError as e:
+                            self._handle_oom(e)
+                            continue
+                        except RuntimeError as e:
+                            # Some allocator failures surface as plain
+                            # RuntimeError ("CUDA error: out of memory",
+                            # cuBLAS/cuDNN handle alloc failures, etc.).
+                            msg = str(e).lower()
+                            if "out of memory" in msg or "cuda error" in msg:
+                                self._handle_oom(e)
+                                continue
+                            raise
+                    else:
+                        self.run_step()
                     # => after_step
                     self.after_step()
                 # => after epoch
                 self.after_epoch()
             # => after train
             self.after_train()
+
+    def _handle_oom(self, exc):
+        """Free GPU memory and log a skip line so an OOM-killed batch
+        doesn't terminate the run."""
+        # Drop references that may pin GPU memory.
+        self.comm_info.pop("input_dict", None)
+        self.comm_info.pop("model_output_dict", None)
+        # Zero grads in case backward partially populated them before
+        # OOM -- otherwise the next optimizer step would apply stale
+        # garbage.
+        try:
+            self.optimizer.zero_grad(set_to_none=True)
+        except Exception:
+            pass
+        # Reset gradient-accumulation counter so the next batch starts
+        # a fresh accumulation window.
+        self._gradient_accumulation_counter = 0
+        # Free cached blocks so the allocator can defragment.
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        ipe = self.comm_info.get("iter_per_epoch", 0)
+        it = self.comm_info.get("iter", -1)
+        self.logger.warning(
+            f"[oom-skip] OOM at epoch {self.epoch} iter {it}/{ipe}: "
+            f"{type(exc).__name__}: {exc}. Skipping batch."
+        )
 
     def run_step(self):
         if version.parse(torch.__version__) >= version.parse("2.4"):
