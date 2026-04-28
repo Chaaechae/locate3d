@@ -167,8 +167,67 @@ class InformationWriter(HookBase):
 
 @HOOKS.register_module()
 class CheckpointSaver(HookBase):
-    def __init__(self, save_freq=None):
+    def __init__(self, save_freq=None, iter_save_freq=None):
         self.save_freq = save_freq  # None or int, None indicate only save model last
+        # NEW: save model_last.pth every iter_save_freq iterations within
+        # an epoch. Useful for long epochs (0j-encoder-ft) where OOM /
+        # node-eviction late in an epoch loses many hours of work. Set
+        # via ``dict(type="CheckpointSaver", iter_save_freq=500)`` in
+        # the config's ``hooks`` list. None disables (default behavior:
+        # save only at epoch boundaries).
+        self.iter_save_freq = iter_save_freq
+
+    def _save_last(self, extra=None):
+        """Atomic write of model_last.pth. Used from both after_step
+        (iter-based) and after_epoch (epoch-based) so a resume from
+        either is consistent."""
+        filename = os.path.join(
+            self.trainer.cfg.save_path, "model", "model_last.pth"
+        )
+        ckpt = {
+            "epoch": self.trainer.epoch + 1,
+            "state_dict": self.trainer.model.state_dict(),
+            "optimizer": self.trainer.optimizer.state_dict(),
+            "scheduler": self.trainer.scheduler.state_dict(),
+            "scaler": (
+                self.trainer.scaler.state_dict()
+                if self.trainer.cfg.enable_amp
+                else None
+            ),
+            "best_metric_value": self.trainer.best_metric_value,
+        }
+        if extra:
+            ckpt.update(extra)
+        torch.save(ckpt, filename + ".tmp")
+        os.replace(filename + ".tmp", filename)
+        return filename
+
+    def after_step(self):
+        if self.iter_save_freq is None or not is_main_process():
+            return
+        # comm_info["iter"] is the per-epoch iteration index (0-based).
+        # Trigger every iter_save_freq steps; (+1) so we save at iter
+        # 499 / 999 / ... rather than 0 / 500 (which would save before
+        # the first useful step on epoch 0).
+        it = self.trainer.comm_info.get("iter", None)
+        if it is None:
+            return
+        if (it + 1) % self.iter_save_freq != 0:
+            return
+        # Compute global step for the log line.
+        ipe = self.trainer.comm_info.get("iter_per_epoch", 0) or 0
+        global_step = self.trainer.epoch * ipe + (it + 1)
+        # Save model_last.pth (overwriting the previous save). Doesn't
+        # touch model_best.pth -- iter saves don't have a fresh val
+        # metric and thus shouldn't compete for "best".
+        self._save_last(
+            extra={"iter": it + 1, "global_step": global_step}
+        )
+        self.trainer.logger.info(
+            f"[ckpt] iter-save model_last.pth at "
+            f"epoch {self.trainer.epoch} iter {it+1}/{ipe} "
+            f"(global_step={global_step})"
+        )
 
     def after_epoch(self):
         if is_main_process():
@@ -198,26 +257,8 @@ class CheckpointSaver(HookBase):
                     )
                 )
 
-            filename = os.path.join(
-                self.trainer.cfg.save_path, "model", "model_last.pth"
-            )
+            filename = self._save_last()
             self.trainer.logger.info("Saving checkpoint to: " + filename)
-            torch.save(
-                {
-                    "epoch": self.trainer.epoch + 1,
-                    "state_dict": self.trainer.model.state_dict(),
-                    "optimizer": self.trainer.optimizer.state_dict(),
-                    "scheduler": self.trainer.scheduler.state_dict(),
-                    "scaler": (
-                        self.trainer.scaler.state_dict()
-                        if self.trainer.cfg.enable_amp
-                        else None
-                    ),
-                    "best_metric_value": self.trainer.best_metric_value,
-                },
-                filename + ".tmp",
-            )
-            os.replace(filename + ".tmp", filename)
             if is_best:
                 shutil.copyfile(
                     filename,
