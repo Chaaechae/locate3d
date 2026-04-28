@@ -270,9 +270,39 @@ class Trainer(TrainerBase):
             reserved = torch.cuda.memory_reserved() / (1024 ** 3)
             peak = torch.cuda.max_memory_allocated() / (1024 ** 3)
             diag.append(
-                f"mem alloc={allocated:.2f}GB reserved={reserved:.2f}GB "
+                f"gpu alloc={allocated:.2f}GB reserved={reserved:.2f}GB "
                 f"peak={peak:.2f}GB"
             )
+        except Exception:
+            pass
+        # Host memory snapshot. Hard OOM-kills (the gloo
+        # ``op.preamble.length`` failure surfaced as) usually trace
+        # back to host RAM exhaustion -- DataLoader workers + scene
+        # tensors that haven't been GC'd. Surface it alongside GPU
+        # numbers so the user can tell which ceiling is the real one.
+        try:
+            import psutil
+            vm = psutil.virtual_memory()
+            proc = psutil.Process()
+            rss = proc.memory_info().rss / (1024 ** 3)
+            diag.append(
+                f"host rss={rss:.2f}GB used={vm.used/1024**3:.1f}/"
+                f"{vm.total/1024**3:.1f}GB ({vm.percent:.0f}%)"
+            )
+        except ImportError:
+            try:
+                with open("/proc/meminfo") as f:
+                    info = dict(
+                        line.split(":", 1) for line in f if ":" in line
+                    )
+                avail_kb = int(info["MemAvailable"].strip().split()[0])
+                total_kb = int(info["MemTotal"].strip().split()[0])
+                diag.append(
+                    f"host avail={avail_kb/1024**2:.1f}/"
+                    f"{total_kb/1024**2:.1f}GB"
+                )
+            except Exception:
+                pass
         except Exception:
             pass
 
