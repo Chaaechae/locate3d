@@ -95,6 +95,42 @@ class TesterBase:
 
     def build_test_loader(self):
         test_dataset = build_dataset(self.cfg.data.test)
+
+        # Pre-filter: drop scenes whose ``_pred.npy`` is already on disk
+        # so the test transform pipeline (multiple GridSamples for
+        # fragment generation -- the dominant per-scene cost) doesn't
+        # run for already-finished scenes. Their metrics are recomputed
+        # at the end of ``test()`` from the saved .npy files.
+        # Toggle off via ``--options test_skip_existing=False`` if you
+        # want the old "iterate every scene; load existing pred inside
+        # the loop" behavior.
+        if (getattr(self.cfg, "test_skip_existing", True)
+                and isinstance(self.cfg.save_path, str)
+                and hasattr(test_dataset, "data_list")):
+            save_dir = os.path.join(self.cfg.save_path, "result")
+            if os.path.isdir(save_dir):
+                done = {
+                    f[: -len("_pred.npy")]
+                    for f in os.listdir(save_dir)
+                    if f.endswith("_pred.npy")
+                }
+                if done:
+                    n_orig = len(test_dataset.data_list)
+                    keep = [
+                        i for i in range(n_orig)
+                        if test_dataset.get_data_name(i) not in done
+                    ]
+                    test_dataset.data_list = [
+                        test_dataset.data_list[i] for i in keep
+                    ]
+                    n_after = len(test_dataset.data_list)
+                    if n_after < n_orig and comm.is_main_process():
+                        print(
+                            f"[test_skip_existing] {n_orig - n_after}/"
+                            f"{n_orig} scenes already done; will compute "
+                            f"final metric from disk after the loop."
+                        )
+
         if comm.get_world_size() > 1:
             test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset)
         else:
@@ -318,11 +354,27 @@ class SemSegTester(TesterBase):
                 r = record_sync.pop()
                 record.update(r)
                 del r
-            intersection = np.sum(
-                [meters["intersection"] for _, meters in record.items()], axis=0
-            )
-            union = np.sum([meters["union"] for _, meters in record.items()], axis=0)
-            target = np.sum([meters["target"] for _, meters in record.items()], axis=0)
+
+            # When ``test_skip_existing`` filtered the loader, ``record``
+            # only covers scenes processed in THIS run. Recompute the
+            # global metric by walking save_path/*_pred.npy.
+            # Fresh runs (no skipped scenes) hit the same code path; the
+            # disk-walk just sees exactly the scenes the loop processed.
+            if getattr(self.cfg, "test_skip_existing", True):
+                intersection, union, target = self._metrics_from_disk(
+                    save_path, logger
+                )
+            else:
+                intersection = np.sum(
+                    [meters["intersection"] for _, meters in record.items()],
+                    axis=0,
+                )
+                union = np.sum(
+                    [meters["union"] for _, meters in record.items()], axis=0
+                )
+                target = np.sum(
+                    [meters["target"] for _, meters in record.items()], axis=0
+                )
 
             if self.cfg.data.test.type == "S3DISDataset":
                 torch.save(
@@ -351,6 +403,70 @@ class SemSegTester(TesterBase):
                     )
                 )
             logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
+
+    def _metrics_from_disk(self, save_path, logger):
+        """Aggregate intersection / union / target from every
+        ``*_pred.npy`` saved under ``save_path``. Reloads each scene's
+        GT segment via a fresh dataset (the test_loader's dataset has
+        been filtered, so we rebuild here).
+
+        Skips the test transform pipeline entirely -- only the raw
+        segment label is needed. Used after the inference loop so
+        resumed runs report the global metric (this-run + previously-
+        saved scenes) instead of just this-run.
+        """
+        full_dataset = build_dataset(self.cfg.data.test)
+        name_to_idx = {
+            full_dataset.get_data_name(i): i
+            for i in range(len(full_dataset.data_list))
+        }
+        num_classes = self.cfg.data.num_classes
+        ignore_index = self.cfg.data.ignore_index
+        intersection_total = np.zeros(num_classes, dtype=np.float64)
+        union_total = np.zeros(num_classes, dtype=np.float64)
+        target_total = np.zeros(num_classes, dtype=np.float64)
+        n_seen = 0
+        n_skipped = 0
+        for fname in sorted(os.listdir(save_path)):
+            if not fname.endswith("_pred.npy"):
+                continue
+            data_name = fname[: -len("_pred.npy")]
+            if data_name not in name_to_idx:
+                n_skipped += 1
+                continue
+            try:
+                sample = full_dataset.get_data(name_to_idx[data_name])
+            except Exception as e:
+                logger.warning(
+                    f"[disk-metric] {data_name}: get_data raised "
+                    f"{type(e).__name__}: {e}; skipping."
+                )
+                n_skipped += 1
+                continue
+            segment = sample["segment"].astype(np.int32)
+            pred = np.load(os.path.join(save_path, fname))
+            if pred.ndim > 1:
+                # ScanNetPP saves top-3; only the top-1 is used for mIoU.
+                pred = pred[..., 0]
+            if pred.shape[0] != segment.shape[0]:
+                logger.warning(
+                    f"[disk-metric] {data_name}: pred {pred.shape} vs "
+                    f"segment {segment.shape} length mismatch; skipping."
+                )
+                n_skipped += 1
+                continue
+            intersection, union, target = intersection_and_union(
+                pred, segment, num_classes, ignore_index
+            )
+            intersection_total += intersection
+            union_total += union
+            target_total += target
+            n_seen += 1
+        logger.info(
+            f"[disk-metric] aggregated {n_seen} scenes from {save_path}"
+            + (f" ({n_skipped} skipped)" if n_skipped else "")
+        )
+        return intersection_total, union_total, target_total
 
     @staticmethod
     def collate_fn(batch):
