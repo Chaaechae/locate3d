@@ -502,6 +502,34 @@ def main():
                 prob = 1.0 / (1.0 + np.exp(-pred_logits[g]))
                 pred_paint_masks.append(prob > args.infer_threshold)
 
+        # Diagnostic: surface why paint may not show. Common bug
+        # patterns (1) checkpoint pre-dates pred_logits_full_per_entity
+        # so we silently fell back to subsampled logits which won't
+        # match coord shape; (2) infer_threshold too high so prob is
+        # always below it; (3) sub_idx scatter left the rendered
+        # subset entirely at -1e9.
+        if args.pred_mode == "paint":
+            full_key = "pred_logits_full_per_entity" in out
+            print(
+                f"[paint-dbg] scene={scene_id} N_coord={coord.shape[0]} "
+                f"used_full_logits={full_key} "
+                f"pred_logits.shape="
+                f"{None if pred_logits is None else pred_logits.shape}"
+            )
+            if pred_logits is not None:
+                for g in range(pred_logits.shape[0]):
+                    prob_g = 1.0 / (1.0 + np.exp(-pred_logits[g]))
+                    n_above = int((prob_g > args.infer_threshold).sum())
+                    pmax = float(prob_g.max())
+                    pmean = float(prob_g.mean())
+                    n_finite = int(np.isfinite(pred_logits[g]).sum())
+                    print(
+                        f"  entity_{g}: n_pts_finite_logit={n_finite}/"
+                        f"{prob_g.shape[0]} prob_max={pmax:.3f} "
+                        f"prob_mean={pmean:.3f} "
+                        f"n_above_{args.infer_threshold}={n_above}"
+                    )
+
         # Resolve:
         #   entity_names[g]  = human-readable name per entity
         #   entity_tokens[g] = list of caption words that drove entity g
