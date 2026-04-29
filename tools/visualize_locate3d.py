@@ -412,6 +412,17 @@ def main():
     _load_checkpoint(model, args.weight)
     model = model.cuda().eval()
 
+    # Disable eval-time point subsampling. The training-time subsample
+    # (max_points_{train,eval}) caps memory for BCE+Dice. At viz time
+    # we render single samples, so dropping the cap has negligible
+    # memory cost (one extra dot product over ~100k pts) but ensures
+    # ``pred_logits`` and ``pred_logits_full_per_entity`` both align
+    # with the full ``coord`` array the renderer plots. Without this,
+    # paint mode silently no-ops on any scene with N > max_points_eval.
+    for attr in ("max_points_eval", "max_points_train"):
+        if hasattr(model, attr):
+            setattr(model, attr, None)
+
     # -- dataset --
     dataset = _build_dataset(args, cfg)
     print(f"[dataset] {args.dataset}: {len(dataset)} annotations "
