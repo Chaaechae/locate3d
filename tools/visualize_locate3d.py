@@ -440,7 +440,14 @@ def main():
             out = model(batch_gpu)
 
         pred_boxes_per = out.get("pred_boxes_per_entity", None)
-        pred_logits_per = out.get("pred_logits_per_entity", None)
+        # Prefer the FULL-coord logits (scattered back to all input
+        # points) over the subsampled ones. The renderer's mask trace
+        # and paint logic both align to ``coord`` (full N), so the
+        # subsampled (G, N_b) tensor would silently fail the shape
+        # check.
+        pred_logits_per = out.get("pred_logits_full_per_entity", None)
+        if pred_logits_per is None:
+            pred_logits_per = out.get("pred_logits_per_entity", None)
         if pred_boxes_per is None or pred_boxes_per[0] is None:
             print(f"[skip] model returned no pred_boxes_per_entity for {ds_idx}")
             continue

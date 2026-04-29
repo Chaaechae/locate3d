@@ -387,5 +387,28 @@ class Locate3DSegDetector(nn.Module):
             # (not yet integrated; grounding evaluator expects Locate3D schema)
             result["pred_boxes_per_entity"] = pred_boxes_list
             result["pred_logits_per_entity"] = pred_logits_list
+            # Also expose: per-entity logits SCATTERED back to the full
+            # post-backbone coord (N_b = subsampled point count -> N_full
+            # = full per-sample point count from offset). This is what
+            # downstream visualizers need; shape (G, N_full) so it
+            # aligns with the same coord array the renderer plots.
+            # Non-sampled positions get -inf (i.e. sigmoid -> 0).
+            full_logits_list = []
+            full_coords_list = []
+            for b in range(len(pred_logits_list)):
+                logits_b = pred_logits_list[b]                  # (G, N_b)
+                idx_b = sub_idx[b]                              # (N_b,)
+                full_n = int(coords_list[b].shape[0])
+                G = int(logits_b.shape[0])
+                full_logits = torch.full(
+                    (G, full_n), -1e9,
+                    device=logits_b.device, dtype=logits_b.dtype,
+                )
+                if idx_b.numel() > 0 and G > 0:
+                    full_logits[:, idx_b] = logits_b
+                full_logits_list.append(full_logits)
+                full_coords_list.append(coords_list[b])
+            result["pred_logits_full_per_entity"] = full_logits_list
+            result["pred_coord_full_per_sample"] = full_coords_list
 
         return result
