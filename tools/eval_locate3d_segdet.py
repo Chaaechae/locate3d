@@ -85,6 +85,14 @@ def main():
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--max-batches", type=int, default=None,
                     help="stop after N batches (smoke test). None=full.")
+    ap.add_argument("--dataset", default="auto",
+                    choices=("auto", "scannet", "arkit", "scannetpp"),
+                    help="Filter the val set to a single sub-dataset. "
+                         "auto: use whatever cfg.data.val builds (which "
+                         "honors LOCATE3D_USE_ARKIT / LOCATE3D_USE_SCANNETPP "
+                         "env vars). The other choices override that and "
+                         "pick exactly one corpus, even when the config's "
+                         "val ends up as a ConcatDataset.")
     args = ap.parse_args()
 
     iou_thresholds = [float(t) for t in args.iou_thresholds.split(",")]
@@ -100,6 +108,36 @@ def main():
     # Build val dataset (respects LOCATE3D_USE_ARKIT / LOCATE3D_USE_SCANNETPP
     # env vars baked into the config).
     val_dataset = build_dataset(cfg.data.val)
+
+    # Optional CLI override: filter to a single corpus regardless of how
+    # the config was built. ConcatDataset stores its children in
+    # ``.datasets``; we extract the matching one by adapter class name.
+    if args.dataset != "auto":
+        wanted = {
+            "scannet": "ScanNetLocate3DDataset",
+            "arkit": "ARKitScenesLocate3DDataset",
+            "scannetpp": "ScanNetPPLocate3DDataset",
+        }[args.dataset]
+        if hasattr(val_dataset, "datasets"):
+            children = list(val_dataset.datasets)
+            picked = [d for d in children if type(d).__name__ == wanted]
+            if not picked:
+                raise RuntimeError(
+                    f"--dataset {args.dataset!r} requested but the config "
+                    f"didn't build a {wanted}. Children present: "
+                    f"{[type(d).__name__ for d in children]}. Either "
+                    f"unset LOCATE3D_USE_* env vars or use --dataset auto."
+                )
+            val_dataset = picked[0]
+            print(f"[data] filtered ConcatDataset -> {wanted} only")
+        else:
+            actual = type(val_dataset).__name__
+            if actual != wanted:
+                raise RuntimeError(
+                    f"--dataset {args.dataset!r} requested ({wanted}) but "
+                    f"config built {actual}. Either unset LOCATE3D_USE_* "
+                    f"env vars or use --dataset auto."
+                )
     print(f"[data] val dataset: {type(val_dataset).__name__} "
           f"len={len(val_dataset)}")
     val_loader = torch.utils.data.DataLoader(
