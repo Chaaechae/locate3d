@@ -37,5 +37,12 @@ from .scanobjectnn import (
 from .partnet import PartNetDataDataset
 from .partnete import PartNetEDataset
 
+# localization / referring expression grounding
+from .arkitscenes_locate3d import ARKitScenesLocate3DDataset
+from .scannet_locate3d import (
+    ScanNetLocate3DDataset,
+    ScanNetPPLocate3DDataset,
+)
+
 # dataloader
 from .dataloader import MultiDatasetDataloader
