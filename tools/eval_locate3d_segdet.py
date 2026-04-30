@@ -85,6 +85,13 @@ def main():
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--max-batches", type=int, default=None,
                     help="stop after N batches (smoke test). None=full.")
+    ap.add_argument("--mask-threshold", type=float, default=None,
+                    help="override the model's infer_threshold (sigmoid > t "
+                         "for converting per-point logits into the "
+                         "predicted mask). Default None = use the value "
+                         "baked into the config (typically 0.5). Set "
+                         "explicitly to match eval_locate3d_baseline.py's "
+                         "--mask-threshold for an apples-to-apples comparison.")
     ap.add_argument("--dataset", default="auto",
                     choices=("auto", "scannet", "arkit", "scannetpp"),
                     help="Filter the val set to a single sub-dataset. "
@@ -152,6 +159,11 @@ def main():
     # Build model + load checkpoint.
     model = build_model(cfg.model).cuda().eval()
     _load_checkpoint(model, args.weight)
+    if args.mask_threshold is not None and hasattr(model, "infer_threshold"):
+        old = model.infer_threshold
+        model.infer_threshold = args.mask_threshold
+        print(f"[model] infer_threshold {old} -> {args.mask_threshold} "
+              f"(matches eval_locate3d_baseline.py --mask-threshold)")
 
     total = 0
     hits = {t: 0 for t in iou_thresholds}
