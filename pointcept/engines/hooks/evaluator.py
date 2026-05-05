@@ -921,3 +921,130 @@ class PartNetEPartSegEvaluator(HookBase):
                 self.trainer.best_metric_value,
             )
         )
+
+
+@HOOKS.register_module()
+class Locate3DGroundingEvaluator(HookBase):
+    """Top-1 box-grounding Accuracy @ IoU-0.25 / IoU-0.5 for the referring
+    expression task. Follows the BUTD-DETR / Locate-3D evaluation recipe: the
+    query with the highest summed text-alignment score on the positive tokens
+    of the primary object is selected, and its predicted box is compared
+    against the primary ground-truth box (``primary_object_id``)."""
+
+    def __init__(self, iou_thresholds=(0.25, 0.5)):
+        self.iou_thresholds = tuple(iou_thresholds)
+
+    def before_train(self):
+        if self.trainer.writer is not None and self.trainer.cfg.enable_wandb:
+            wandb.define_metric("val/*", step_metric="Epoch")
+
+    def after_epoch(self):
+        if self.trainer.cfg.evaluate:
+            self.eval()
+
+    @staticmethod
+    def _iou_3d(a, b):
+        lt = torch.maximum(a[:3], b[:3])
+        rb = torch.minimum(a[3:], b[3:])
+        wh = (rb - lt).clamp_min(0.0)
+        inter = wh[0] * wh[1] * wh[2]
+        vol_a = (a[3:] - a[:3]).clamp_min(0.0).prod()
+        vol_b = (b[3:] - b[:3]).clamp_min(0.0).prod()
+        union = vol_a + vol_b - inter
+        return (inter / union.clamp_min(1e-6)).item()
+
+    def eval(self):
+        self.trainer.logger.info(
+            ">>>>>>>>>>>>>>>> Start Locate3D Grounding Evaluation >>>>>>>>>>>>>>>>"
+        )
+        self.trainer.model.eval()
+
+        total = 0
+        hits = {t: 0 for t in self.iou_thresholds}
+
+        for i, input_dict in enumerate(self.trainer.val_loader):
+            for key in list(input_dict.keys()):
+                if isinstance(input_dict[key], torch.Tensor):
+                    input_dict[key] = input_dict[key].cuda(non_blocking=True)
+            with torch.no_grad():
+                output_dict = self.trainer.model(input_dict)
+
+            pred_logits = output_dict["pred_logits"]
+            pred_boxes = output_dict["pred_boxes"]
+
+            positive_map_list = input_dict["positive_map"]
+            boxes_list = input_dict["boxes_xyzxyz"]
+            primary_ids = input_dict.get("primary_object_id", [0] * len(boxes_list))
+
+            B = pred_logits.shape[0]
+            for b in range(B):
+                pos_map = positive_map_list[b].to(pred_logits.device)
+                gt_boxes = boxes_list[b].to(pred_boxes.device)
+                pid = primary_ids[b] if b < len(primary_ids) else None
+                if pid is None:
+                    primary = 0
+                elif isinstance(pid, torch.Tensor):
+                    primary = int(pid.flatten()[0].item())
+                else:
+                    primary = int(pid)
+                if primary >= pos_map.shape[0]:
+                    continue
+
+                prob = pred_logits[b].sigmoid()
+                score = prob @ pos_map[primary].float()
+                q_idx = int(score.argmax())
+                pred = pred_boxes[b, q_idx]
+                iou = self._iou_3d(pred, gt_boxes[primary])
+                total += 1
+                for t in self.iou_thresholds:
+                    if iou >= t:
+                        hits[t] += 1
+
+            # free per-batch tensors before loading the next (often much
+            # larger) scene, to avoid allocator fragmentation OOM after many
+            # variable-sized evaluations.
+            del output_dict, pred_logits, pred_boxes
+            torch.cuda.empty_cache()
+
+        if comm.get_world_size() > 1:
+            total_t = torch.tensor([total], dtype=torch.long, device="cuda")
+            dist.all_reduce(total_t)
+            total = int(total_t.item())
+            for t in self.iou_thresholds:
+                ht = torch.tensor([hits[t]], dtype=torch.long, device="cuda")
+                dist.all_reduce(ht)
+                hits[t] = int(ht.item())
+
+        metrics = {f"Acc@{t:g}": (hits[t] / max(total, 1)) for t in self.iou_thresholds}
+        self.trainer.logger.info(
+            "Val Locate3D grounding: "
+            + " / ".join(f"{k}: {v:.4f}" for k, v in metrics.items())
+            + f" (N={total})"
+        )
+
+        current_epoch = self.trainer.epoch + 1
+        if self.trainer.writer is not None:
+            for k, v in metrics.items():
+                self.trainer.writer.add_scalar(f"val/{k}", v, current_epoch)
+            if self.trainer.cfg.enable_wandb:
+                wandb.log(
+                    {"Epoch": current_epoch, **{f"val/{k}": v for k, v in metrics.items()}},
+                    step=wandb.run.step,
+                )
+
+        key = f"Acc@{self.iou_thresholds[0]:g}"
+        self.trainer.comm_info["current_metric_value"] = metrics[key]
+        self.trainer.comm_info["current_metric_name"] = key
+        # Expose the full metrics dict (+ sample count) to non-wandb loggers.
+        self.trainer.comm_info["val_extras"] = {
+            **{f"val_{k}": float(v) for k, v in metrics.items()},
+            "val_num_samples": int(total),
+        }
+
+    def after_train(self):
+        self.trainer.logger.info(
+            "Best {}: {:.4f}".format(
+                self.trainer.comm_info.get("current_metric_name", "metric"),
+                self.trainer.best_metric_value,
+            )
+        )
