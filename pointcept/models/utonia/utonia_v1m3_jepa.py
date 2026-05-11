@@ -404,9 +404,13 @@ class UtoniaJEPA(Utonia):
 
         result_dict["loss"] = sum(result_dict["loss"])
 
-        if get_world_size() > 1:
+        ws = get_world_size()
+        if ws > 1:
+            # Gloo backend는 ReduceOp.AVG를 지원하지 않으므로 SUM 후 나눠서 평균 계산.
+            # NCCL이면 AVG 한 줄과 동일.
             for loss_id, loss in result_dict.items():
-                dist.all_reduce(loss, op=dist.ReduceOp.AVG)
+                dist.all_reduce(loss, op=dist.ReduceOp.SUM)
+                loss.div_(ws)
 
         _dbg_print(
             "EXIT forward()  losses=("
