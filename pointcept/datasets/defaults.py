@@ -467,8 +467,31 @@ class DefaultImagePointDataset(Dataset):
     def __getitem__(self, idx):
         if self.test_mode:
             return self.prepare_test_data(idx)
-        else:
-            return self.prepare_train_data(idx)
+
+        # Skip-on-error during training. Some pretraining datasets occasionally
+        # have samples missing optional fields (e.g. 'normal'), which surfaces as
+        # a KeyError inside the transform pipeline (MultiViewGenerator etc.).
+        # Rather than crashing the whole training, we log a warning and retry
+        # with the next index. ``max_retry`` bounds the recursion in case many
+        # samples are bad.
+        max_retry = 16
+        original_idx = idx
+        for attempt in range(max_retry):
+            try:
+                return self.prepare_train_data(idx)
+            except Exception as e:
+                logger = get_root_logger()
+                logger.warning(
+                    f"[DefaultImagePointDataset] Skipping sample idx={idx} "
+                    f"(attempt {attempt + 1}/{max_retry}, original={original_idx}) "
+                    f"due to {type(e).__name__}: {e}"
+                )
+                idx = (idx + 1) % len(self)
+        raise RuntimeError(
+            f"DefaultImagePointDataset.__getitem__ failed for {max_retry} "
+            f"consecutive samples starting at idx={original_idx}. "
+            f"Likely systemic data issue, not transient."
+        )
 
     def __len__(self):
         return len(self.data_list) * self.loop
