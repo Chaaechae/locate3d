@@ -128,6 +128,7 @@ model = dict(
 
 # scheduler settings — finetune: epoch 15, lr 1/5
 epoch = 15
+eval_epoch = 15       # cfg.epoch % cfg.eval_epoch == 0 만족 (default 100 그대로면 assert 실패)
 base_lr = 0.0008      # v1m1 stagev1: 0.004 → 1/5
 lr_decay = 0.9
 base_wd = 0.04
@@ -521,39 +522,40 @@ data = dict(
     train=dict(
         type="ConcatDataset",
         datasets=[
-            dict(
-                type="WaymoImagePointDataset",
-                if_sweep=True,
-                if_img=True,
-                sweeps=3,
-                sweep_gap=1,
-                crop_h=crop_h,
-                crop_w=crop_w,
-                patch_size=patch_size,
-                split=["training", "validation"],
-                data_root="data/waymo",
-                transform=outdoor_transform,
-                test_mode=False,
-                loop=1,
-            ),
-            dict(
-                type="PartNetDataDataset",
-                crop_h=crop_h,
-                crop_w=crop_w,
-                patch_size=patch_size,
-                split=["train"],
-                data_root="data/partnet_data_v0",
-                transform=obj_transform,
-                test_mode=False,
-                loop=1,
-            ),
+            # Waymo / PartNet은 Stage 1 단순 검증을 위해 비활성화 (실내 두 셋만 사용)
+            # dict(
+            #     type="WaymoImagePointDataset",
+            #     if_sweep=True,
+            #     if_img=True,
+            #     sweeps=3,
+            #     sweep_gap=1,
+            #     crop_h=crop_h,
+            #     crop_w=crop_w,
+            #     patch_size=patch_size,
+            #     split=["training", "validation"],
+            #     data_root="data/waymo",
+            #     transform=outdoor_transform,
+            #     test_mode=False,
+            #     loop=1,
+            # ),
+            # dict(
+            #     type="PartNetDataDataset",
+            #     crop_h=crop_h,
+            #     crop_w=crop_w,
+            #     patch_size=patch_size,
+            #     split=["train"],
+            #     data_root="data/partnet_data_v0",
+            #     transform=obj_transform,
+            #     test_mode=False,
+            #     loop=1,
+            # ),
             dict(
                 type="DefaultImagePointDataset",
                 crop_h=crop_h,
                 crop_w=crop_w,
                 patch_size=patch_size,
                 split=["train", "val", "test"],
-                data_root="data/scannet",
+                data_root="/group-volume/3Ddataset/scannet-compressed",
                 transform=indoor_transform,
                 test_mode=False,
                 loop=1,
@@ -564,7 +566,7 @@ data = dict(
                 crop_w=crop_w,
                 patch_size=patch_size,
                 split=["train", "val", "test"],
-                data_root="data/structured3d",
+                data_root="/group-volume/3Ddataset/structure3d-compressed",
                 transform=indoor_transform,
                 test_mode=False,
                 loop=1,
