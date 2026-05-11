@@ -14,6 +14,8 @@ Utonia v1m1 위에 *연속 latent prediction (JEPA-style)* 신호를 5번째 손
 자세한 단계 계획: docs/utonia_jepa_staged_plan.md
 """
 
+import os
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,9 +24,28 @@ import torch_scatter
 
 from pointcept.models.utils.structure import Point
 from pointcept.models.builder import MODELS
-from pointcept.utils.comm import get_world_size
+from pointcept.utils.comm import get_world_size, get_rank
 
 from .utonia_v1m1_base import Utonia
+
+
+# Debug verbosity: print stage timings for the first N forward calls per rank.
+# Override at runtime via env var:  UTONIA_JEPA_DEBUG_ITERS=20
+_DEBUG_ITERS = int(os.environ.get("UTONIA_JEPA_DEBUG_ITERS", "5"))
+
+
+def _dbg_print(tag, t_start, fwd_count):
+    """Rank-0 only, first _DEBUG_ITERS forward calls only."""
+    if fwd_count > _DEBUG_ITERS:
+        return
+    try:
+        rank = get_rank()
+    except Exception:
+        rank = 0
+    if rank != 0:
+        return
+    elapsed = time.time() - t_start
+    print(f"[v1m3 fwd#{fwd_count} +{elapsed:7.3f}s] {tag}", flush=True)
 
 
 class JEPAPredictor(nn.Module):
@@ -116,9 +137,49 @@ class UtoniaJEPA(Utonia):
             dropout=jepa_predictor_dropout,
         )
 
+        # Debug counter: number of forward calls (for staged timing prints).
+        self._fwd_count = 0
+
+        try:
+            rank = get_rank()
+        except Exception:
+            rank = 0
+        if rank == 0:
+            n_params = sum(p.numel() for p in self.parameters())
+            n_pred = sum(p.numel() for p in self.predictor.parameters())
+            print(
+                f"[v1m3 init] total_params={n_params/1e6:.2f}M, "
+                f"predictor_params={n_pred/1e6:.2f}M, "
+                f"loss_weights=(mask={self.mask_loss_weight:.3f}, "
+                f"roll={self.roll_mask_loss_weight:.3f}, "
+                f"unmask={self.unmask_loss_weight:.3f}, "
+                f"enc2d={self.enc2d_loss_weight:.3f}, "
+                f"jepa={self.jepa_loss_weight:.3f})",
+                flush=True,
+            )
+
+    def before_train(self):
+        super().before_train()
+        try:
+            rank = get_rank()
+        except Exception:
+            rank = 0
+        if rank == 0:
+            print(
+                f"[v1m3 before_train] model ready. "
+                f"UTONIA_JEPA_DEBUG_ITERS={_DEBUG_ITERS} "
+                f"(set env var to change verbose iters).",
+                flush=True,
+            )
+
     def forward(self, data_dict, return_point=False):
         if return_point:
             return super().forward(data_dict, return_point=True)
+
+        # === Debug: stage timing for the first few forward calls ===
+        self._fwd_count += 1
+        _t0 = time.time()
+        _dbg_print("ENTER forward()", _t0, self._fwd_count)
 
         # ===== Prepare points & masks (v1m1과 동일) =====
         with torch.no_grad():
@@ -161,10 +222,12 @@ class UtoniaJEPA(Utonia):
             )
 
             result_dict = dict(loss=[])
+            _dbg_print("prepared points & masks", _t0, self._fwd_count)
 
             # teacher forward
             global_point_ = self.teacher.backbone(global_point)
             global_point_ = self.up_cast(global_point_)
+            _dbg_print("teacher.backbone(global) done", _t0, self._fwd_count)
 
             # ★ JEPA target은 head 적용 *전* raw feature.
             # v1m1은 아래에서 global_point_.feat을 head 출력으로 덮어쓰므로 여기서 보관.
@@ -188,6 +251,7 @@ class UtoniaJEPA(Utonia):
         if need_student_masked_forward:
             mask_global_point_ = self.student.backbone(mask_global_point)
             mask_global_point_ = self.up_cast(mask_global_point_)
+            _dbg_print("student.backbone(masked global) done", _t0, self._fwd_count)
 
             # student raw feat (jepa용) — head 적용 전에 보관
             if self.jepa_loss_weight > 0:
@@ -286,6 +350,11 @@ class UtoniaJEPA(Utonia):
             result_dict["jepa_loss"] = jepa_loss
             result_dict["loss"].append(jepa_loss * self.jepa_loss_weight)
 
+            # === Health monitor (collapse 조기 감지) ===
+            # 매 50 step마다 rank-0이 tensorboard에 기록. trainer/writer가 없으면 skip.
+            self._log_jepa_health(teacher_raw_feat, z_student, z_target)
+            _dbg_print("jepa loss done", _t0, self._fwd_count)
+
         # ===== unmask loss (v1m1과 동일) =====
         if self.unmask_loss_weight > 0:
             local_point_ = self.student.backbone(local_point)
@@ -331,6 +400,7 @@ class UtoniaJEPA(Utonia):
                 major_view_correspondence,
                 result_dict,
             )
+            _dbg_print("enc2d loss done", _t0, self._fwd_count)
 
         result_dict["loss"] = sum(result_dict["loss"])
 
@@ -338,7 +408,66 @@ class UtoniaJEPA(Utonia):
             for loss_id, loss in result_dict.items():
                 dist.all_reduce(loss, op=dist.ReduceOp.AVG)
 
+        _dbg_print(
+            "EXIT forward()  losses=("
+            + ", ".join(
+                f"{k}={float(v):.4f}"
+                for k, v in result_dict.items()
+                if k != "loss" and isinstance(v, torch.Tensor) and v.ndim == 0
+            )
+            + f", total={float(result_dict['loss']):.4f})",
+            _t0,
+            self._fwd_count,
+        )
+
         return result_dict
+
+    # --- monitor / debug helpers ---
+    @torch.no_grad()
+    def _log_jepa_health(self, teacher_raw_feat, z_student, z_target):
+        """Log collapse-detector scalars to tensorboard/wandb (rank-0, every 50 iter).
+
+        - teacher_feat_std: target encoder의 채널별 표준편차의 평균. 0으로 수렴하면 collapse.
+        - teacher_feat_norm_mean: target feature norm 평균. 폭주/소실 감지.
+        - predictor_out_std: predictor 출력의 채널별 표준편차의 평균. 0이면 자명해.
+        - jepa_cos_avg: predictor 예측과 teacher target의 평균 cosine similarity.
+          학습 진행에 따라 0 → 양수로 상승해야 함 (1에 가까우면 너무 쉬워 collapse 의심).
+        """
+        trainer = getattr(self, "trainer", None)
+        if trainer is None or getattr(trainer, "writer", None) is None:
+            return
+        # 매 50 iter (또는 _DEBUG_ITERS 이내 항상)
+        comm_info = getattr(trainer, "comm_info", {}) or {}
+        it = comm_info.get("iter", 0) + getattr(trainer, "epoch", 0) * comm_info.get(
+            "iter_per_epoch", 1
+        )
+        if it % 50 != 0 and self._fwd_count > _DEBUG_ITERS:
+            return
+        try:
+            rank = get_rank()
+        except Exception:
+            rank = 0
+        if rank != 0:
+            return
+
+        t_std = teacher_raw_feat.float().std(dim=0).mean().item()
+        t_norm = teacher_raw_feat.float().norm(dim=-1).mean().item()
+        p_std = z_student.float().std(dim=0).mean().item()
+        cos_avg = (z_student.float() * z_target.float()).sum(dim=-1).mean().item()
+
+        w = trainer.writer
+        w.add_scalar("monitor/teacher_feat_std", t_std, it)
+        w.add_scalar("monitor/teacher_feat_norm_mean", t_norm, it)
+        w.add_scalar("monitor/predictor_out_std", p_std, it)
+        w.add_scalar("monitor/jepa_cos_avg", cos_avg, it)
+
+        # 초반 iters에는 stdout에도 같이 출력
+        if self._fwd_count <= _DEBUG_ITERS:
+            print(
+                f"[v1m3 monitor it={it}] teacher_std={t_std:.4f} "
+                f"teacher_norm={t_norm:.3f} pred_std={p_std:.4f} cos={cos_avg:.4f}",
+                flush=True,
+            )
 
     # --- helpers ---
     @staticmethod

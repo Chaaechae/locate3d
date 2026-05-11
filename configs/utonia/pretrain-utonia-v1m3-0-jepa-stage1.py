@@ -35,6 +35,7 @@ enable_amp = True
 amp_dtype = "bfloat16"
 evaluate = False
 find_unused_parameters = True
+enable_wandb = False
 
 
 # model settings
@@ -566,7 +567,7 @@ data = dict(
                 crop_w=crop_w,
                 patch_size=patch_size,
                 split=["train", "val", "test"],
-                data_root="/group-volume/3Ddataset/structure3d-compressed",
+                data_root="/group-volume/3Ddataset/structured3d-compressed",
                 transform=indoor_transform,
                 test_mode=False,
                 loop=1,
