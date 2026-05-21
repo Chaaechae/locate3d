@@ -389,6 +389,13 @@ def main():
                     help="opacity for scene RGB cloud (0..1)")
     ap.add_argument("--scene-max-points", type=int, default=120000,
                     help="cap rendered scene point count")
+    ap.add_argument("--entity-head", default=None,
+                    help="path to a trained EntityHead .pth. When given, "
+                         "the positive_map fed to the SegDetector is "
+                         "PREDICTED from the caption by EntityHead "
+                         "instead of being read from the annotation. "
+                         "Lets the chained system handle raw captions "
+                         "without ann['entities'].")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -423,6 +430,52 @@ def main():
         if hasattr(model, attr):
             setattr(model, attr, None)
 
+    # -- optional: EntityHead chained inference --
+    # When --entity-head is given, the positive_map fed to the
+    # SegDetector at each sample is PREDICTED from the caption by
+    # EntityHead instead of being read from ann["entities"]. Lets us
+    # visualize what the system would output on raw user queries
+    # (no annotation entity field) while still using ScanNet val
+    # scenes for direct comparison with the annotation-based path.
+    entity_head = None
+    entity_clip_text = None
+    entity_clip_tok = None
+    if args.entity_head is not None:
+        print(f"[entity-head] loading from {args.entity_head}")
+        from pointcept.models.locate_3d.entity_head import EntityHead
+        from transformers import AutoTokenizer, CLIPTextModel
+        eh_ckpt = torch.load(
+            args.entity_head, map_location="cpu", weights_only=False
+        )
+        K = eh_ckpt.get("max_entities", 4)
+        clip_path = eh_ckpt.get(
+            "clip_path",
+            os.environ.get(
+                "LOCATE3D_CLIP_PATH",
+                "openai/clip-vit-large-patch14",
+            ),
+        )
+        is_local = os.path.isdir(clip_path)
+        entity_clip_tok = AutoTokenizer.from_pretrained(
+            clip_path, local_files_only=is_local
+        )
+        entity_clip_text = CLIPTextModel.from_pretrained(
+            clip_path, local_files_only=is_local
+        ).cuda().eval()
+        for p in entity_clip_text.parameters():
+            p.requires_grad = False
+        entity_head = EntityHead(
+            d_model=entity_clip_text.config.hidden_size,
+            max_entities=K,
+            n_layers=eh_ckpt.get("args", {}).get("n_layers", 2),
+        ).cuda().eval()
+        # tolerate slight key naming drift across PyTorch versions
+        info = entity_head.load_state_dict(
+            eh_ckpt["state_dict"], strict=False
+        )
+        print(f"[entity-head] missing={len(info.missing_keys)} "
+              f"unexpected={len(info.unexpected_keys)} max_entities={K}")
+
     # -- dataset --
     dataset = _build_dataset(args, cfg)
     print(f"[dataset] {args.dataset}: {len(dataset)} annotations "
@@ -446,6 +499,49 @@ def main():
 
         batch = locate3d_collate_fn([copy.deepcopy(sample)])
         batch_gpu = _sample_to_gpu(batch)
+
+        # If --entity-head was given, replace batch_gpu["positive_map"]
+        # with EntityHead's prediction from the raw caption. Otherwise
+        # the SegDetector sees the annotation-built positive_map.
+        eh_dbg = ""
+        if entity_head is not None:
+            caption_list = batch_gpu.get("caption", None)
+            if isinstance(caption_list, list) and caption_list:
+                caption = caption_list[0]
+            else:
+                caption = str(caption_list)
+            enc = entity_clip_tok(
+                [caption], return_tensors="pt",
+                padding="max_length", truncation=True, max_length=77,
+            )
+            input_ids = enc.input_ids.cuda()
+            attention_mask = enc.attention_mask.cuda()
+            with torch.no_grad():
+                text_feats = entity_clip_text(
+                    input_ids=input_ids, attention_mask=attention_mask
+                ).last_hidden_state                              # (1, 77, 768)
+                pred_pos = entity_head.predict_positive_map(
+                    text_feats, attention_mask=attention_mask,
+                )                                                 # (1, K, 77)
+            # Drop empty entity rows so we feed the SegDetector only
+            # the entities EntityHead actually predicted (G_actual).
+            row_active = pred_pos.sum(dim=-1) > 0                 # (1, K)
+            G_actual = int(row_active[0].sum().item())
+            if G_actual == 0:
+                # EntityHead failed to find any entity. Skip this
+                # sample with a clear log line.
+                print(f"[skip] entity-head predicted 0 entities for "
+                      f"caption {caption!r}; using annotation map instead")
+            else:
+                pred_pos_filtered = pred_pos[0][row_active[0]]    # (G_actual, 77)
+                # Cast to the dtype/device the SegDetector pools with.
+                # The decoder will do positive_map @ text_feats so we
+                # leave it as float on cuda.
+                batch_gpu["positive_map"] = [pred_pos_filtered.float()]
+                eh_dbg = (f" [entity-head: predicted G={G_actual} "
+                          f"entities from raw caption]")
+        if eh_dbg:
+            print(f"[sample {ds_idx}]{eh_dbg}")
 
         with torch.no_grad():
             out = model(batch_gpu)
