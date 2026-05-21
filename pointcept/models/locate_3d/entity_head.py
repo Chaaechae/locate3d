@@ -97,18 +97,60 @@ class EntityHead(nn.Module):
         return logits
 
     @staticmethod
-    def loss(logits, token_labels, label_smoothing: float = 0.1):
-        """Per-token cross-entropy. ``ignore_index=-1`` skips non-entity
-        and padding tokens (no learning signal from them, since the
-        positive class is what we care about and the negative class is
-        the trivial majority)."""
+    def loss(
+        logits,
+        token_labels,
+        attention_mask=None,
+        label_smoothing: float = 0.0,
+        no_entity_weight: float = 0.25,
+        supervise_no_entity: bool = True,
+    ):
+        """Per-token cross-entropy.
+
+        With ``supervise_no_entity=True`` (the new default), -1 labels
+        are mapped to the last class (K = max_entities = "no entity")
+        so the model is actively trained to PREDICT "no entity" at
+        articles / prepositions / filler tokens. Without this, the
+        model is only told the entity tokens' classes -- it has no
+        signal that "beside" / "the" / "is" should NOT be classified
+        as an entity, so non-entity tokens get absorbed into the
+        nearest entity (the user-reported failure mode).
+
+        ``attention_mask``, if given, gates which positions contribute
+        to the loss (padding tokens always ignored).
+
+        ``no_entity_weight`` (default 0.25) downweights the K class so
+        it doesn't drown out the rarer entity classes (~80% of valid
+        tokens are no-entity; 0.25 ≈ inverse frequency).
+
+        ``supervise_no_entity=False`` reverts to the old
+        ignore_index=-1 behavior for ablation / backward-compat.
+        """
         B, T, K1 = logits.shape
-        return F.cross_entropy(
-            logits.reshape(B * T, K1),
-            token_labels.reshape(B * T),
-            ignore_index=-1,
-            label_smoothing=label_smoothing,
-        )
+        K = K1 - 1
+        labels = token_labels.clone()
+        if supervise_no_entity:
+            # Map -1 (no-entity content) -> K (the explicit "no entity"
+            # class), then ignore only padding.
+            labels[labels == -1] = K
+            if attention_mask is not None:
+                labels[~attention_mask.bool()] = -100  # ignore padding
+            weight = torch.ones(K1, device=logits.device, dtype=logits.dtype)
+            weight[K] = no_entity_weight
+            return F.cross_entropy(
+                logits.reshape(B * T, K1),
+                labels.reshape(B * T),
+                ignore_index=-100,
+                weight=weight,
+                label_smoothing=label_smoothing,
+            )
+        else:
+            return F.cross_entropy(
+                logits.reshape(B * T, K1),
+                labels.reshape(B * T),
+                ignore_index=-1,
+                label_smoothing=label_smoothing,
+            )
 
     @torch.no_grad()
     def predict_positive_map(

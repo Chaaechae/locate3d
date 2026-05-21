@@ -167,7 +167,18 @@ def main():
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--warmup-ratio", type=float, default=0.05)
     ap.add_argument("--n-layers", type=int, default=2)
-    ap.add_argument("--label-smoothing", type=float, default=0.1)
+    ap.add_argument("--label-smoothing", type=float, default=0.05)
+    ap.add_argument("--no-entity-weight", type=float, default=0.25,
+                    help="weight for the 'no entity' (K) class in the "
+                         "CE loss. Lower = entity classes dominate the "
+                         "gradient (encouraged when no-entity tokens "
+                         "are 4-5x more frequent, which they are).")
+    ap.add_argument("--legacy-ignore-no-entity", action="store_true",
+                    help="revert to the old loss: ignore -1 labels "
+                         "instead of supervising them as the K class. "
+                         "Diagnostic only -- causes the model to "
+                         "over-extend entity spans across non-entity "
+                         "filler tokens.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--keep-epochs", type=int, default=3,
@@ -250,8 +261,13 @@ def main():
 
             text_feats = _encode_text(clip, input_ids, attention_mask)
             logits = head(text_feats, attention_mask=attention_mask)
-            loss = head.loss(logits, token_labels,
-                             label_smoothing=args.label_smoothing)
+            loss = head.loss(
+                logits, token_labels,
+                attention_mask=attention_mask,
+                label_smoothing=args.label_smoothing,
+                no_entity_weight=args.no_entity_weight,
+                supervise_no_entity=not args.legacy_ignore_no_entity,
+            )
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
