@@ -170,6 +170,10 @@ def main():
     ap.add_argument("--label-smoothing", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--log-every", type=int, default=50)
+    ap.add_argument("--keep-epochs", type=int, default=3,
+                    help="keep the last N epoch_<N>.pth backups so a "
+                         "truncated model_last.pth write can't wipe "
+                         "out a working checkpoint. 0 = disable.")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -278,8 +282,11 @@ def main():
             f"n_entity={metrics['n_entity_total']} "
             f"n_utt={metrics['n_utt_total']})")
 
-        # Save model_last every epoch.
-        torch.save({
+        # Save model_last every epoch. Atomic rename to avoid leaving
+        # half-written files; immediately re-load to verify the bytes
+        # are intact (cheap check, catches truncated writes early so
+        # we don't lose the run hours later).
+        ckpt_payload = {
             "epoch": epoch + 1,
             "state_dict": head.state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -288,11 +295,38 @@ def main():
             "max_entities": K,
             "clip_path": train_ds.clip_path,
             "val_metrics": metrics,
-        }, os.path.join(args.output_dir, "model_last.pth.tmp"))
-        os.replace(
-            os.path.join(args.output_dir, "model_last.pth.tmp"),
-            os.path.join(args.output_dir, "model_last.pth"),
-        )
+        }
+        last_path = os.path.join(args.output_dir, "model_last.pth")
+        tmp_path = last_path + ".tmp"
+        torch.save(ckpt_payload, tmp_path)
+        os.replace(tmp_path, last_path)
+        try:
+            _ = torch.load(last_path, map_location="cpu", weights_only=False)
+        except Exception as e:
+            log(f"[epoch {epoch}] [ckpt-error] verify failed: "
+                f"{type(e).__name__}: {e}. Likely truncated write; "
+                f"check disk space + permissions.")
+
+        # Epoch backup: keep a non-overwriting copy so a later
+        # truncated write can't wipe out earlier good checkpoints.
+        # Keeps the last --keep-epochs backups by default (3).
+        keep = getattr(args, "keep_epochs", 3)
+        if keep > 0:
+            import shutil as _shutil
+            epoch_path = os.path.join(
+                args.output_dir, f"model_epoch{epoch:03d}.pth"
+            )
+            _shutil.copyfile(last_path, epoch_path)
+            # Prune older epoch backups beyond ``keep`` count.
+            existing = sorted(
+                f for f in os.listdir(args.output_dir)
+                if f.startswith("model_epoch") and f.endswith(".pth")
+            )
+            for old in existing[:-keep]:
+                try:
+                    os.remove(os.path.join(args.output_dir, old))
+                except OSError:
+                    pass
         # Track best by primary_acc (most directly tied to grounding
         # downstream usage; token_acc / entity_recall are
         # diagnostically useful but primary is what we ultimately
