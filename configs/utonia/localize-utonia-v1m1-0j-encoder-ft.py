@@ -74,9 +74,9 @@ enable_wandb = False
 
 train = dict(type="Locate3DTrainer")
 
-arkit_root = "/group-volume/3Ddataset/arkitscenes-compressed"
-scannet_root = "/group-volume/3Ddataset/scannet-compressed"
-scannetpp_root = "/group-volume/3Ddataset/scannetpp-compressed"
+arkit_root = "/group-volume/3Ddataset/data/arkitscenes"
+scannet_root = "/group-volume/3Ddataset/data/scannet"
+scannetpp_root = "/group-volume/3Ddataset/data/scannetpp"
 
 # --- Dataset inclusion env-var guards ---
 # Set the following before launching to opt sub-corpora out for ablations:

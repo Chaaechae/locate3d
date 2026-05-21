@@ -100,6 +100,15 @@ def main():
                          "env vars). The other choices override that and "
                          "pick exactly one corpus, even when the config's "
                          "val ends up as a ConcatDataset.")
+    ap.add_argument("--arkit-root", default=None,
+                    help="override cfg's arkit_root (data_root for "
+                         "ARKitScenesLocate3DDataset). Useful when the "
+                         "dataset has moved on disk relative to what the "
+                         "config was committed against.")
+    ap.add_argument("--scannet-root", default=None,
+                    help="override cfg's scannet_root")
+    ap.add_argument("--scannetpp-root", default=None,
+                    help="override cfg's scannetpp_root")
     args = ap.parse_args()
 
     iou_thresholds = [float(t) for t in args.iou_thresholds.split(",")]
@@ -111,6 +120,33 @@ def main():
             "config has no data.val; check the localize-* config "
             "templates that build data dict from env vars."
         )
+
+    # Optional CLI override: rewrite data_root entries that match
+    # our three localize dataset types. Recursively walks the val
+    # dict (ConcatDataset wraps a list of child dataset dicts).
+    root_overrides = {
+        "ARKitScenesLocate3DDataset": args.arkit_root,
+        "ScanNetLocate3DDataset": args.scannet_root,
+        "ScanNetPPLocate3DDataset": args.scannetpp_root,
+    }
+    root_overrides = {k: v for k, v in root_overrides.items() if v is not None}
+
+    def _rewrite_data_root(node):
+        if hasattr(node, "items") and hasattr(node, "get"):  # dict-like
+            t = node.get("type")
+            if t in root_overrides:
+                old = node.get("data_root")
+                node["data_root"] = root_overrides[t]
+                print(f"[cfg-override] {t}.data_root: {old!r} -> "
+                      f"{root_overrides[t]!r}")
+            for v in list(node.values()):
+                _rewrite_data_root(v)
+        elif isinstance(node, (list, tuple)):
+            for v in node:
+                _rewrite_data_root(v)
+
+    if root_overrides:
+        _rewrite_data_root(cfg.data.val)
 
     # Build val dataset (respects LOCATE3D_USE_ARKIT / LOCATE3D_USE_SCANNETPP
     # env vars baked into the config).

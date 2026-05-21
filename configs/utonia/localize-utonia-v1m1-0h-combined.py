@@ -56,11 +56,13 @@ train = dict(type="Locate3DTrainer")
 
 # --------- dataset paths (EDIT THESE TO YOUR ENVIRONMENT) ---------
 # Pointcept-preprocessed per-scene ``.npy`` trees. Layout on user's box:
-#   /group-volume/3Ddataset/{arkitscenes,scannet,scannetpp}-compressed/
+#   /group-volume/3Ddataset/data/{arkitscenes,scannet,scannetpp}/
 #     {train,val,test}/<scene_id>/{coord,color,normal,instance,...}.npy
-arkit_root = "/group-volume/3Ddataset/arkitscenes-compressed"
-scannet_root = "/group-volume/3Ddataset/scannet-compressed"
-scannetpp_root = "/group-volume/3Ddataset/scannetpp-compressed"
+#   (ARKit uses {Training,Validation} subdir names; the adapter
+#   defaults handle that automatically.)
+arkit_root = "/group-volume/3Ddataset/data/arkitscenes"
+scannet_root = "/group-volume/3Ddataset/data/scannet"
+scannetpp_root = "/group-volume/3Ddataset/data/scannetpp"
 
 # Annotation JSONs. ARKit ones ship with this repo. The ScanNet /
 # ScanNet++ JSONs are published at
