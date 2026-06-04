@@ -37,6 +37,10 @@ from .scanobjectnn import (
 from .partnet import PartNetDataDataset
 from .partnete import PartNetEDataset
 
+# Qwen3.5-VL <-> Utonia alignment: skip-on-error wrapper around
+# DefaultImagePointDataset (logs + skips bad scenes instead of crashing).
+from .skip_on_error_dataset import SkipOnErrorImagePointDataset
+
 # localization / referring expression grounding
 from .arkitscenes_locate3d import ARKitScenesLocate3DDataset
 from .scannet_locate3d import (

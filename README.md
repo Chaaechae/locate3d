@@ -12,12 +12,15 @@
 
 [![Formatter](https://github.com/pointcept/pointcept/actions/workflows/formatter.yml/badge.svg)](https://github.com/pointcept/pointcept/actions/workflows/formatter.yml)
 
-> **📍 This fork adds a 3D referring-expression localization task** on top of the
-> Utonia encoder, trained on the Locate-3D dataset (ScanNet + ARKitScenes +
-> ScanNet++). If that's why you're here, start with
-> [`docs/localization/README.md`](docs/localization/README.md) (how to train &
-> run the full framework) and [`docs/localization/LEARNINGS.md`](docs/localization/LEARNINGS.md)
-> (the design/debugging post-mortem). The rest of this README is upstream Pointcept.
+> **📍 이 fork은 Utonia encoder 위에 두 가지 다운스트림 작업을 추가합니다** (문서는 한국어):
+> - **3D 참조표현 localization** (Locate-3D 데이터셋, ScanNet + ARKitScenes + ScanNet++) —
+>   [`docs/localization/README.md`](docs/localization/README.md) (학습 & 전체 framework 실행법),
+>   [`docs/localization/LEARNINGS.md`](docs/localization/LEARNINGS.md) (설계/디버깅 post-mortem).
+> - **Qwen3.5-VL ↔ Utonia 2D-3D 정렬(distillation)** —
+>   [`docs/qwen_alignment/README.md`](docs/qwen_alignment/README.md) (이 저장소에서의 실행법),
+>   [`docs/qwen_alignment/QWEN3_5_ALIGNMENT_SUMMARY.md`](docs/qwen_alignment/QWEN3_5_ALIGNMENT_SUMMARY.md) (종합 정리).
+>
+> The rest of this README is upstream Pointcept.
 
 **Pointcept** is a powerful and flexible codebase for point cloud perception research. It is also an official implementation of the following paper:
 - 🚀 **Utonia: Toward One Encoder for All Point Clouds**  
