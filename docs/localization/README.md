@@ -244,13 +244,13 @@ python tools/eval_locate3d_segdet.py \
 
 | 설정 | val Acc@0.25 | AccAll@0.25 | AccAll@0.5 |
 |---|---|---|---|
-| `0f` ARKit-only, ~991 anns | ~0.03 @ ep12 | — | — |
+| 단일 코퍼스 (ARKit only), 초기 검증 | ~0.03 @ ep12 | — | — |
 | `0h` ARKit + ScanNet | **0.54** @ ep15 | 0.50 | 0.42 |
-| `0i` (잘못된 retune, 되돌림) | 0.20 @ ep100 | — | — |
 
-`0h`가 핵심 성공 결과이고, `0i`/`0j`는 그 위의 더 긴 스케줄과 encoder fine-tune
-단계입니다. `0i (잘못된 retune)` 행은 교훈으로 남긴 데이터 포인트입니다 —
-`LEARNINGS.md` §5 참고.
+`0h`가 핵심 성공 결과이고, `0i`/`0j`는 그 위에 각각 "더 긴 스케줄"과 "encoder
+fine-tune"을 더한 단계입니다. 단일 코퍼스 행은 "방식 자체는 학습되지만 데이터
+규모가 병목"임을 보여주는 초기 검증 결과입니다 — 자세한 배경은
+[`LEARNINGS.md`](./LEARNINGS.md) 참고.
 
 ---
 
