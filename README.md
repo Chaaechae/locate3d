@@ -12,6 +12,13 @@
 
 [![Formatter](https://github.com/pointcept/pointcept/actions/workflows/formatter.yml/badge.svg)](https://github.com/pointcept/pointcept/actions/workflows/formatter.yml)
 
+> **📍 This fork adds a 3D referring-expression localization task** on top of the
+> Utonia encoder, trained on the Locate-3D dataset (ScanNet + ARKitScenes +
+> ScanNet++). If that's why you're here, start with
+> [`docs/localization/README.md`](docs/localization/README.md) (how to train &
+> run the full framework) and [`docs/localization/LEARNINGS.md`](docs/localization/LEARNINGS.md)
+> (the design/debugging post-mortem). The rest of this README is upstream Pointcept.
+
 **Pointcept** is a powerful and flexible codebase for point cloud perception research. It is also an official implementation of the following paper:
 - 🚀 **Utonia: Toward One Encoder for All Point Clouds**  
 *Yujia Zhang, Xiaoyang Wu, Yunhan Yang, Xianzhe Fan, Han Li, Yuechen Zhang, Zehao Huang, Naiyan Wang, Hengshuang Zhao*  

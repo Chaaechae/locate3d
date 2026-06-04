@@ -27,6 +27,7 @@ from .defaults import create_ddp_model, worker_init_fn
 from .hooks import HookBase, build_hooks
 import pointcept.utils.comm as comm
 from pointcept.datasets import build_dataset, point_collate_fn, collate_fn
+from pointcept.datasets.locate3d_collate import locate3d_collate_fn
 from pointcept.models import build_model
 from pointcept.utils.logger import get_root_logger
 from pointcept.utils.optimizer import build_optimizer
@@ -159,12 +160,23 @@ class Trainer(TrainerBase):
             # => before train
             self.before_train()
             self.logger.info(">>>>>>>>>>>>>>>> Start Training >>>>>>>>>>>>>>>>")
+            # Per-step OOM resilience: catch CUDA OOM (and certain
+            # spurious cuBLAS/cuDNN failures), free memory, skip the
+            # offending batch, and keep training. Disable by setting
+            # ``cfg.oom_skip_batch=False`` if the deterministic-crash
+            # behavior is preferred (e.g. for debugging).
+            oom_skip_batch = getattr(self.cfg, "oom_skip_batch", True)
             for self.epoch in range(self.start_epoch, self.max_epoch):
                 # => before epoch
                 if comm.get_world_size() > 1:
                     self.train_loader.sampler.set_epoch(self.epoch)
                 self.model.train()
                 self.data_iterator = enumerate(self.train_loader)
+                # iter_per_epoch needs to be set BEFORE the OOM logger
+                # uses it; ConfigureMisc / pre-existing setters do this
+                # in before_train, but mid-epoch re-entry can leave the
+                # value stale. Refresh defensively here.
+                self.comm_info["iter_per_epoch"] = len(self.train_loader)
                 self.before_epoch()
                 # => run_epoch
                 for (
@@ -173,14 +185,236 @@ class Trainer(TrainerBase):
                 ) in self.data_iterator:
                     # => before_step
                     self.before_step()
-                    # => run_step
-                    self.run_step()
+
+                    # Imbalance probe: log per-rank input point count
+                    # every ``rank_probe_every`` iters so we can see
+                    # which rank is getting big/small scenes WITHOUT
+                    # waiting for an OOM. Crash diagnostics from inside
+                    # _handle_oom only fire on failure -- this fires
+                    # proactively. Disable with ``rank_probe_every=0``.
+                    rank_probe_every = getattr(
+                        self.cfg, "rank_probe_every", 50
+                    )
+                    if (rank_probe_every > 0
+                            and self.comm_info["iter"] % rank_probe_every == 0):
+                        self._log_rank_imbalance()
+                    # => run_step (OOM-resilient)
+                    if oom_skip_batch:
+                        try:
+                            self.run_step()
+                            oom_local = 0
+                        except torch.cuda.OutOfMemoryError as e:
+                            self._handle_oom(e)
+                            oom_local = 1
+                        except RuntimeError as e:
+                            msg = str(e).lower()
+                            if "out of memory" in msg or "cuda error" in msg:
+                                self._handle_oom(e)
+                                oom_local = 1
+                            else:
+                                raise
+                        # DDP-safe OOM coordination. If ANY rank skipped
+                        # the batch, ALL ranks must also skip the
+                        # subsequent optimizer.step / DDP all_reduce
+                        # cycle, otherwise the reducer state goes out of
+                        # sync ("Expected to have finished reduction in
+                        # the prior iteration"). One rank doing
+                        # `continue` while others did backward is the
+                        # exact trigger.
+                        if comm.get_world_size() > 1:
+                            flag = torch.tensor(
+                                [oom_local], dtype=torch.int32, device="cuda"
+                            )
+                            torch.distributed.all_reduce(
+                                flag, op=torch.distributed.ReduceOp.MAX
+                            )
+                            global_oom = int(flag.item())
+                        else:
+                            global_oom = oom_local
+                        if global_oom:
+                            # Force every rank into a clean state, even
+                            # the ones that ran successfully -- their
+                            # backward populated grads + DDP buckets,
+                            # which would clash with the OOM rank's
+                            # zeroed state on the next iter.
+                            if oom_local == 0:
+                                self._handle_oom_remote()
+                            continue
+                    else:
+                        self.run_step()
                     # => after_step
                     self.after_step()
                 # => after epoch
                 self.after_epoch()
             # => after train
             self.after_train()
+
+    def _handle_oom(self, exc):
+        """Free GPU memory + log diagnostics. Called on the rank that
+        actually raised the OOM."""
+        # Drop references that may pin GPU memory.
+        input_dict = self.comm_info.pop("input_dict", None)
+        self.comm_info.pop("model_output_dict", None)
+        try:
+            self.optimizer.zero_grad(set_to_none=True)
+        except Exception:
+            pass
+        self._gradient_accumulation_counter = 0
+
+        # Log scene-level info BEFORE empty_cache (the input batch is
+        # what's most useful for diagnosing which sample blew up).
+        diag = []
+        if isinstance(input_dict, dict):
+            for key in ("scene_id", "name", "caption"):
+                v = input_dict.get(key)
+                if isinstance(v, list) and v:
+                    diag.append(f"{key}={v[0]!r}")
+                elif v is not None:
+                    diag.append(f"{key}={v!r}")
+            for key in ("coord", "feat"):
+                t = input_dict.get(key)
+                if hasattr(t, "shape"):
+                    diag.append(f"{key}.shape={tuple(t.shape)}")
+            if "offset" in input_dict and hasattr(input_dict["offset"], "tolist"):
+                diag.append(f"offset={input_dict['offset'].tolist()}")
+        # GPU memory snapshot (pre-empty-cache so we see the actual peak).
+        try:
+            allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+            reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+            peak = torch.cuda.max_memory_allocated() / (1024 ** 3)
+            diag.append(
+                f"gpu alloc={allocated:.2f}GB reserved={reserved:.2f}GB "
+                f"peak={peak:.2f}GB"
+            )
+        except Exception:
+            pass
+        # Host memory snapshot. Hard OOM-kills (the gloo
+        # ``op.preamble.length`` failure surfaced as) usually trace
+        # back to host RAM exhaustion -- DataLoader workers + scene
+        # tensors that haven't been GC'd. Surface it alongside GPU
+        # numbers so the user can tell which ceiling is the real one.
+        try:
+            import psutil
+            vm = psutil.virtual_memory()
+            proc = psutil.Process()
+            rss = proc.memory_info().rss / (1024 ** 3)
+            diag.append(
+                f"host rss={rss:.2f}GB used={vm.used/1024**3:.1f}/"
+                f"{vm.total/1024**3:.1f}GB ({vm.percent:.0f}%)"
+            )
+        except ImportError:
+            try:
+                with open("/proc/meminfo") as f:
+                    info = dict(
+                        line.split(":", 1) for line in f if ":" in line
+                    )
+                avail_kb = int(info["MemAvailable"].strip().split()[0])
+                total_kb = int(info["MemTotal"].strip().split()[0])
+                diag.append(
+                    f"host avail={avail_kb/1024**2:.1f}/"
+                    f"{total_kb/1024**2:.1f}GB"
+                )
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        torch.cuda.reset_peak_memory_stats()
+
+        ipe = self.comm_info.get("iter_per_epoch", 0)
+        it = self.comm_info.get("iter", -1)
+        rank = comm.get_rank() if comm.get_world_size() > 1 else 0
+        self._oom_count = getattr(self, "_oom_count", 0) + 1
+        self.logger.warning(
+            f"[oom-skip] rank={rank} epoch={self.epoch} iter={it}/{ipe} "
+            f"oom_count={self._oom_count} {type(exc).__name__}: {exc} "
+            f"|| {' '.join(diag)}"
+        )
+
+    def _handle_oom_remote(self):
+        """Mirror _handle_oom on a rank that did NOT itself OOM but
+        must abort the current step because some other rank did. Drops
+        gradients populated by this rank's successful backward so DDP's
+        bucket state matches the OOM rank's zeroed state."""
+        self.comm_info.pop("input_dict", None)
+        self.comm_info.pop("model_output_dict", None)
+        try:
+            self.optimizer.zero_grad(set_to_none=True)
+        except Exception:
+            pass
+        self._gradient_accumulation_counter = 0
+        torch.cuda.empty_cache()
+        rank = comm.get_rank() if comm.get_world_size() > 1 else 0
+        self.logger.warning(
+            f"[oom-skip] rank={rank} epoch={self.epoch} "
+            f"iter={self.comm_info.get('iter', -1)}: "
+            f"peer rank OOM-aborted; matching skip on this rank."
+        )
+
+    def _log_rank_imbalance(self):
+        """Emit a per-rank line showing how many points this rank's
+        current batch contains. After a few prints the imbalance
+        pattern (one rank with 5x point count of the others) becomes
+        obvious. Enabled by cfg.rank_probe_every (default 50)."""
+        input_dict = self.comm_info.get("input_dict", None)
+        if not isinstance(input_dict, dict):
+            return
+        coord = input_dict.get("coord", None)
+        if not hasattr(coord, "shape"):
+            return
+        n_pts = int(coord.shape[0])
+        offset = input_dict.get("offset", None)
+        per_sample = ""
+        if hasattr(offset, "tolist"):
+            o = offset.tolist()
+            sizes = [o[0]] + [o[i] - o[i - 1] for i in range(1, len(o))]
+            per_sample = f" per_sample={sizes}"
+        scene_id = ""
+        sids = input_dict.get("scene_id", None)
+        if isinstance(sids, list) and sids:
+            scene_id = f" scenes={sids}"
+        elif isinstance(sids, str):
+            scene_id = f" scene={sids}"
+
+        rank = comm.get_rank() if comm.get_world_size() > 1 else 0
+        ws = comm.get_world_size()
+        # Coordinate the print across ranks: gather all rank counts so
+        # one line shows the whole batch's spread.
+        if ws > 1:
+            try:
+                t = torch.tensor([n_pts], dtype=torch.long, device="cuda")
+                gathered = [
+                    torch.zeros_like(t) for _ in range(ws)
+                ]
+                torch.distributed.all_gather(gathered, t)
+                all_counts = [int(x.item()) for x in gathered]
+                if rank == 0:
+                    spread = max(all_counts) / max(min(all_counts), 1)
+                    self.logger.info(
+                        f"[rank-probe] iter={self.comm_info['iter']} "
+                        f"per_rank_n_pts={all_counts} "
+                        f"max/min={spread:.1f}x"
+                    )
+                # Always print the rank-local detail (scene_ids etc.)
+                self.logger.info(
+                    f"[rank-probe] rank={rank} n_pts={n_pts}"
+                    f"{per_sample}{scene_id}"
+                )
+            except Exception as e:
+                self.logger.info(
+                    f"[rank-probe] rank={rank} n_pts={n_pts}"
+                    f"{per_sample}{scene_id} (gather failed: {e})"
+                )
+        else:
+            self.logger.info(
+                f"[rank-probe] rank={rank} n_pts={n_pts}"
+                f"{per_sample}{scene_id}"
+            )
 
     def run_step(self):
         if version.parse(torch.__version__) >= version.parse("2.4"):
@@ -354,6 +588,67 @@ class Trainer(TrainerBase):
             grad_scaler = torch.cuda.amp.GradScaler
         scaler = grad_scaler() if self.cfg.enable_amp else None
         return scaler
+
+
+@TRAINERS.register_module("Locate3DTrainer")
+class Locate3DTrainer(Trainer):
+    """Trainer for the Locate-3D referring-expression task.
+
+    Uses ``locate3d_collate_fn`` which keeps per-scene text queries and per-scene
+    box / positive-map targets as Python lists instead of concatenating them.
+    """
+
+    def build_train_loader(self):
+        train_data = build_dataset(self.cfg.data.train)
+
+        if comm.get_world_size() > 1:
+            train_sampler = torch.utils.data.distributed.DistributedSampler(train_data)
+        else:
+            train_sampler = None
+
+        init_fn = (
+            partial(
+                worker_init_fn,
+                num_workers=self.cfg.num_worker_per_gpu,
+                rank=comm.get_rank(),
+                seed=self.cfg.seed,
+            )
+            if self.cfg.seed is not None
+            else None
+        )
+
+        train_loader = torch.utils.data.DataLoader(
+            train_data,
+            batch_size=self.cfg.batch_size_per_gpu,
+            shuffle=(train_sampler is None),
+            num_workers=self.cfg.num_worker_per_gpu,
+            sampler=train_sampler,
+            collate_fn=locate3d_collate_fn,
+            pin_memory=True,
+            worker_init_fn=init_fn,
+            drop_last=len(train_data) > self.cfg.batch_size,
+            persistent_workers=True,
+        )
+        return train_loader
+
+    def build_val_loader(self):
+        val_loader = None
+        if self.cfg.evaluate:
+            val_data = build_dataset(self.cfg.data.val)
+            if comm.get_world_size() > 1:
+                val_sampler = torch.utils.data.distributed.DistributedSampler(val_data)
+            else:
+                val_sampler = None
+            val_loader = torch.utils.data.DataLoader(
+                val_data,
+                batch_size=self.cfg.batch_size_val_per_gpu,
+                shuffle=False,
+                num_workers=self.cfg.num_worker_per_gpu,
+                pin_memory=True,
+                sampler=val_sampler,
+                collate_fn=locate3d_collate_fn,
+            )
+        return val_loader
 
 
 @TRAINERS.register_module("PartialSampledTrainer")

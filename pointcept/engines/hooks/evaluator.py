@@ -921,3 +921,429 @@ class PartNetEPartSegEvaluator(HookBase):
                 self.trainer.best_metric_value,
             )
         )
+
+
+@HOOKS.register_module()
+class Locate3DGroundingEvaluator(HookBase):
+    """Top-1 box-grounding Accuracy @ IoU-0.25 / IoU-0.5 for the referring
+    expression task. Follows the BUTD-DETR / Locate-3D evaluation recipe: the
+    query with the highest summed text-alignment score on the positive tokens
+    of the primary object is selected, and its predicted box is compared
+    against the primary ground-truth box (``primary_object_id``).
+
+    Resilience knobs:
+
+    - ``eval_every_n_epochs`` (default 1): skip eval entirely on epochs
+      whose 1-indexed number is not a multiple of N. Lets a user trade
+      validation frequency for training throughput without editing the
+      inner loop.
+    - Iterator and per-batch exceptions are caught. A proxy / NFS /
+      DataLoader-worker crash during eval is logged and eval exits
+      early with partial metrics; training continues to the next epoch.
+    """
+
+    def __init__(self, iou_thresholds=(0.25, 0.5), eval_every_n_epochs=1):
+        self.iou_thresholds = tuple(iou_thresholds)
+        self.eval_every_n_epochs = max(1, int(eval_every_n_epochs))
+
+    def before_train(self):
+        if self.trainer.writer is not None and self.trainer.cfg.enable_wandb:
+            wandb.define_metric("val/*", step_metric="Epoch")
+
+    def _skip_eval_this_epoch(self):
+        """Return True if we should NOT run eval this epoch. Also ensures
+        downstream hooks that expect ``current_metric_value`` in
+        ``comm_info`` see a sentinel so they don't KeyError."""
+        epoch = self.trainer.epoch + 1
+        if epoch % self.eval_every_n_epochs != 0:
+            # -1.0 will never beat the best so CheckpointSaver won't
+            # spuriously overwrite the "best" checkpoint on skipped epochs.
+            self.trainer.comm_info.setdefault("current_metric_value", -1.0)
+            self.trainer.comm_info.setdefault(
+                "current_metric_name",
+                f"Acc@{self.iou_thresholds[0]:g}",
+            )
+            self.trainer.logger.info(
+                f"[eval] skipping epoch {epoch} (eval_every_n_epochs="
+                f"{self.eval_every_n_epochs})"
+            )
+            return True
+        return False
+
+    def after_epoch(self):
+        if not self.trainer.cfg.evaluate:
+            return
+        if self._skip_eval_this_epoch():
+            return
+        try:
+            self.eval()
+        except Exception as e:
+            # Any unexpected error during eval should NOT kill training.
+            # Log, leave previous metric in place (or the default), and
+            # move on.
+            self.trainer.logger.warning(
+                "[eval] aborted due to {}: {}. Training continues.".format(
+                    type(e).__name__, e,
+                )
+            )
+            self.trainer.comm_info.setdefault("current_metric_value", -1.0)
+            self.trainer.comm_info.setdefault(
+                "current_metric_name",
+                f"Acc@{self.iou_thresholds[0]:g}",
+            )
+
+    @staticmethod
+    def _iou_3d(a, b):
+        lt = torch.maximum(a[:3], b[:3])
+        rb = torch.minimum(a[3:], b[3:])
+        wh = (rb - lt).clamp_min(0.0)
+        inter = wh[0] * wh[1] * wh[2]
+        vol_a = (a[3:] - a[:3]).clamp_min(0.0).prod()
+        vol_b = (b[3:] - b[:3]).clamp_min(0.0).prod()
+        union = vol_a + vol_b - inter
+        return (inter / union.clamp_min(1e-6)).item()
+
+    def eval(self):
+        self.trainer.logger.info(
+            ">>>>>>>>>>>>>>>> Start Locate3D Grounding Evaluation >>>>>>>>>>>>>>>>"
+        )
+        self.trainer.model.eval()
+
+        total = 0
+        hits = {t: 0 for t in self.iou_thresholds}
+
+        # Iterate the val loader manually so a transient error in ANY
+        # single batch (flaky proxy / NFS / DataLoader worker crash) can
+        # be caught and skipped instead of killing training.
+        it = iter(self.trainer.val_loader)
+        i = -1
+        batches_ok = 0
+        batches_err = 0
+        while True:
+            i += 1
+            try:
+                input_dict = next(it)
+            except StopIteration:
+                break
+            except Exception as e:
+                self.trainer.logger.warning(
+                    "[eval] DataLoader fetch raised {}: {}. "
+                    "Aborting val early after {} ok, {} errors.".format(
+                        type(e).__name__, e, batches_ok, batches_err,
+                    )
+                )
+                break
+            try:
+                for key in list(input_dict.keys()):
+                    if isinstance(input_dict[key], torch.Tensor):
+                        input_dict[key] = input_dict[key].cuda(non_blocking=True)
+                with torch.no_grad():
+                    output_dict = self.trainer.model(input_dict)
+
+                pred_logits = output_dict["pred_logits"]
+                pred_boxes = output_dict["pred_boxes"]
+
+                positive_map_list = input_dict["positive_map"]
+                boxes_list = input_dict["boxes_xyzxyz"]
+                primary_ids = input_dict.get("primary_object_id", [0] * len(boxes_list))
+
+                B = pred_logits.shape[0]
+                for b in range(B):
+                    pos_map = positive_map_list[b].to(pred_logits.device)
+                    gt_boxes = boxes_list[b].to(pred_boxes.device)
+                    pid = primary_ids[b] if b < len(primary_ids) else None
+                    if pid is None:
+                        primary = 0
+                    elif isinstance(pid, torch.Tensor):
+                        primary = int(pid.flatten()[0].item())
+                    else:
+                        primary = int(pid)
+                    if primary >= pos_map.shape[0]:
+                        continue
+
+                    prob = pred_logits[b].sigmoid()
+                    score = prob @ pos_map[primary].float()
+                    q_idx = int(score.argmax())
+                    pred = pred_boxes[b, q_idx]
+                    iou = self._iou_3d(pred, gt_boxes[primary])
+                    total += 1
+                    for t in self.iou_thresholds:
+                        if iou >= t:
+                            hits[t] += 1
+
+                del output_dict, pred_logits, pred_boxes
+                torch.cuda.empty_cache()
+                batches_ok += 1
+            except Exception as e:
+                batches_err += 1
+                self.trainer.logger.warning(
+                    "[eval batch {}] {}: {}. Skipping batch.".format(
+                        i, type(e).__name__, e,
+                    )
+                )
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+        if comm.get_world_size() > 1:
+            total_t = torch.tensor([total], dtype=torch.long, device="cuda")
+            dist.all_reduce(total_t)
+            total = int(total_t.item())
+            for t in self.iou_thresholds:
+                ht = torch.tensor([hits[t]], dtype=torch.long, device="cuda")
+                dist.all_reduce(ht)
+                hits[t] = int(ht.item())
+
+        metrics = {f"Acc@{t:g}": (hits[t] / max(total, 1)) for t in self.iou_thresholds}
+        self.trainer.logger.info(
+            "Val Locate3D grounding: "
+            + " / ".join(f"{k}: {v:.4f}" for k, v in metrics.items())
+            + f" (N={total})"
+        )
+
+        current_epoch = self.trainer.epoch + 1
+        if self.trainer.writer is not None:
+            for k, v in metrics.items():
+                self.trainer.writer.add_scalar(f"val/{k}", v, current_epoch)
+            if self.trainer.cfg.enable_wandb:
+                wandb.log(
+                    {"Epoch": current_epoch, **{f"val/{k}": v for k, v in metrics.items()}},
+                    step=wandb.run.step,
+                )
+
+        key = f"Acc@{self.iou_thresholds[0]:g}"
+        self.trainer.comm_info["current_metric_value"] = metrics[key]
+        self.trainer.comm_info["current_metric_name"] = key
+        # Expose the full metrics dict (+ sample count) to non-wandb loggers.
+        self.trainer.comm_info["val_extras"] = {
+            **{f"val_{k}": float(v) for k, v in metrics.items()},
+            "val_num_samples": int(total),
+        }
+
+    def after_train(self):
+        self.trainer.logger.info(
+            "Best {}: {:.4f}".format(
+                self.trainer.comm_info.get("current_metric_name", "metric"),
+                self.trainer.best_metric_value,
+            )
+        )
+
+
+@HOOKS.register_module()
+class Locate3DSegDetectorEvaluator(HookBase):
+    """Acc@IoU evaluator for ``Locate3DSegDetector`` output.
+
+    SegDetector already emits one box per caption entity via the per-point
+    mask AABB, so unlike ``Locate3DGroundingEvaluator`` there is no query
+    selection step. Reports primary-entity Acc and an "AccAll" across every
+    entity in every caption -- useful for multi-entity monitoring.
+    """
+
+    def __init__(self, iou_thresholds=(0.25, 0.5), eval_every_n_epochs=1):
+        self.iou_thresholds = tuple(iou_thresholds)
+        self.eval_every_n_epochs = max(1, int(eval_every_n_epochs))
+
+    def before_train(self):
+        if self.trainer.writer is not None and self.trainer.cfg.enable_wandb:
+            wandb.define_metric("val/*", step_metric="Epoch")
+
+    def _skip_eval_this_epoch(self):
+        epoch = self.trainer.epoch + 1
+        if epoch % self.eval_every_n_epochs != 0:
+            self.trainer.comm_info.setdefault("current_metric_value", -1.0)
+            self.trainer.comm_info.setdefault(
+                "current_metric_name",
+                f"Acc@{self.iou_thresholds[0]:g}",
+            )
+            self.trainer.logger.info(
+                f"[eval] skipping epoch {epoch} (eval_every_n_epochs="
+                f"{self.eval_every_n_epochs})"
+            )
+            return True
+        return False
+
+    def after_epoch(self):
+        if not self.trainer.cfg.evaluate:
+            return
+        if self._skip_eval_this_epoch():
+            return
+        try:
+            self.eval()
+        except Exception as e:
+            self.trainer.logger.warning(
+                "[eval] aborted due to {}: {}. Training continues.".format(
+                    type(e).__name__, e,
+                )
+            )
+            self.trainer.comm_info.setdefault("current_metric_value", -1.0)
+            self.trainer.comm_info.setdefault(
+                "current_metric_name",
+                f"Acc@{self.iou_thresholds[0]:g}",
+            )
+
+    @staticmethod
+    def _iou_3d(a, b):
+        lt = torch.maximum(a[:3], b[:3])
+        rb = torch.minimum(a[3:], b[3:])
+        wh = (rb - lt).clamp_min(0.0)
+        inter = wh[0] * wh[1] * wh[2]
+        vol_a = (a[3:] - a[:3]).clamp_min(0.0).prod()
+        vol_b = (b[3:] - b[:3]).clamp_min(0.0).prod()
+        union = vol_a + vol_b - inter
+        return (inter / union.clamp_min(1e-6)).item()
+
+    def eval(self):
+        self.trainer.logger.info(
+            ">>>>>>>>>>>>>>>> Start Locate3D SegDet Evaluation >>>>>>>>>>>>>>>>"
+        )
+        self.trainer.model.eval()
+
+        total = 0
+        hits = {t: 0 for t in self.iou_thresholds}
+        total_all = 0
+        hits_all = {t: 0 for t in self.iou_thresholds}
+
+        # Robust iteration: a transient proxy/NFS/DataLoader-worker error
+        # on any one batch should be logged and skipped, not kill training.
+        it = iter(self.trainer.val_loader)
+        i = -1
+        batches_ok = 0
+        batches_err = 0
+        while True:
+            i += 1
+            try:
+                input_dict = next(it)
+            except StopIteration:
+                break
+            except Exception as e:
+                self.trainer.logger.warning(
+                    "[eval] DataLoader fetch raised {}: {}. "
+                    "Aborting val early after {} ok, {} errors.".format(
+                        type(e).__name__, e, batches_ok, batches_err,
+                    )
+                )
+                break
+            try:
+                for key in list(input_dict.keys()):
+                    if isinstance(input_dict[key], torch.Tensor):
+                        input_dict[key] = input_dict[key].cuda(non_blocking=True)
+                with torch.no_grad():
+                    output_dict = self.trainer.model(input_dict)
+
+                pred_boxes_per = output_dict.get("pred_boxes_per_entity", None)
+                if pred_boxes_per is None:
+                    continue
+
+                boxes_list = input_dict["boxes_xyzxyz"]
+                primary_ids = input_dict.get(
+                    "primary_object_id", [0] * len(boxes_list)
+                )
+
+                for b in range(len(boxes_list)):
+                    pred_b = pred_boxes_per[b]
+                    if pred_b is None or pred_b.shape[0] == 0:
+                        continue
+                    gt_boxes = boxes_list[b].to(pred_b.device)
+                    pid = primary_ids[b] if b < len(primary_ids) else 0
+                    if isinstance(pid, torch.Tensor):
+                        primary = int(pid.flatten()[0].item())
+                    else:
+                        primary = int(pid)
+                    G = int(gt_boxes.shape[0])
+
+                    K = min(pred_b.shape[0], G)
+                    for g in range(K):
+                        iou = self._iou_3d(pred_b[g], gt_boxes[g])
+                        total_all += 1
+                        for t in self.iou_thresholds:
+                            if iou >= t:
+                                hits_all[t] += 1
+
+                    if primary >= G or primary >= pred_b.shape[0]:
+                        continue
+                    iou_p = self._iou_3d(pred_b[primary], gt_boxes[primary])
+                    total += 1
+                    for t in self.iou_thresholds:
+                        if iou_p >= t:
+                            hits[t] += 1
+
+                del output_dict, pred_boxes_per
+                torch.cuda.empty_cache()
+                batches_ok += 1
+            except Exception as e:
+                batches_err += 1
+                self.trainer.logger.warning(
+                    "[eval batch {}] {}: {}. Skipping batch.".format(
+                        i, type(e).__name__, e,
+                    )
+                )
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+        if comm.get_world_size() > 1:
+            total_t = torch.tensor([total], dtype=torch.long, device="cuda")
+            total_all_t = torch.tensor(
+                [total_all], dtype=torch.long, device="cuda"
+            )
+            dist.all_reduce(total_t)
+            dist.all_reduce(total_all_t)
+            total = int(total_t.item())
+            total_all = int(total_all_t.item())
+            for t in self.iou_thresholds:
+                ht = torch.tensor([hits[t]], dtype=torch.long, device="cuda")
+                hta = torch.tensor(
+                    [hits_all[t]], dtype=torch.long, device="cuda"
+                )
+                dist.all_reduce(ht)
+                dist.all_reduce(hta)
+                hits[t] = int(ht.item())
+                hits_all[t] = int(hta.item())
+
+        metrics = {
+            f"Acc@{t:g}": (hits[t] / max(total, 1))
+            for t in self.iou_thresholds
+        }
+        metrics.update(
+            {
+                f"AccAll@{t:g}": (hits_all[t] / max(total_all, 1))
+                for t in self.iou_thresholds
+            }
+        )
+        self.trainer.logger.info(
+            "Val SegDet grounding: "
+            + " / ".join(f"{k}: {v:.4f}" for k, v in metrics.items())
+            + f" (primary N={total}, all-entity N={total_all})"
+        )
+
+        current_epoch = self.trainer.epoch + 1
+        if self.trainer.writer is not None:
+            for k, v in metrics.items():
+                self.trainer.writer.add_scalar(f"val/{k}", v, current_epoch)
+            if self.trainer.cfg.enable_wandb:
+                wandb.log(
+                    {
+                        "Epoch": current_epoch,
+                        **{f"val/{k}": v for k, v in metrics.items()},
+                    },
+                    step=wandb.run.step,
+                )
+
+        key = f"Acc@{self.iou_thresholds[0]:g}"
+        self.trainer.comm_info["current_metric_value"] = metrics[key]
+        self.trainer.comm_info["current_metric_name"] = key
+        self.trainer.comm_info["val_extras"] = {
+            **{f"val_{k}": float(v) for k, v in metrics.items()},
+            "val_num_samples_primary": int(total),
+            "val_num_samples_all": int(total_all),
+        }
+
+    def after_train(self):
+        self.trainer.logger.info(
+            "Best {}: {:.4f}".format(
+                self.trainer.comm_info.get("current_metric_name", "metric"),
+                self.trainer.best_metric_value,
+            )
+        )
