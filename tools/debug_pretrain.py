@@ -38,7 +38,11 @@ import tempfile
 
 import torch
 
-from pointcept.engines.defaults import default_argument_parser, default_config_parser
+from pointcept.engines.defaults import (
+    default_argument_parser,
+    default_config_parser,
+    default_setup,
+)
 from pointcept.engines.launch import launch
 from pointcept.engines.train import TRAINERS
 import pointcept.utils.comm as comm
@@ -180,6 +184,10 @@ def debug_worker(cfg, max_iters, epochs):
     # Make the debug run self-contained and side-effect free.
     cfg.enable_wandb = False
     cfg.eval_epoch = max(cfg.eval_epoch, 1)
+
+    # Same setup the real entrypoint performs: derive num_worker_per_gpu,
+    # batch_size_per_gpu, seeds, etc. (must run before building the trainer).
+    cfg = default_setup(cfg)
 
     trainer = TRAINERS.build(dict(type=cfg.train.type, cfg=cfg))
     net = _unwrap(trainer.model)
