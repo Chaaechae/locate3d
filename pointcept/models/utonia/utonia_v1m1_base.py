@@ -870,6 +870,10 @@ class Utonia(PointModel):
         result_dict["loss"] = sum(result_dict["loss"])
 
         if get_world_size() > 1:
+            # NOTE: ReduceOp.AVG is NCCL-only; gloo does not support it. Use SUM
+            # followed by a division so this works under both nccl and gloo backends.
+            world_size = get_world_size()
             for loss_id, loss in result_dict.items():
-                dist.all_reduce(loss, op=dist.ReduceOp.AVG)
+                dist.all_reduce(loss, op=dist.ReduceOp.SUM)
+                loss /= world_size
         return result_dict

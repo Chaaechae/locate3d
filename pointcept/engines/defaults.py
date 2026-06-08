@@ -100,6 +100,12 @@ def default_argument_parser(epilog=None):
         "https://pytorch.org/docs/stable/distributed.html for details.",
     )
     parser.add_argument(
+        "--dist-backend",
+        default="nccl",
+        choices=["nccl", "gloo"],
+        help="distributed backend. Use 'gloo' on systems where NCCL is unavailable.",
+    )
+    parser.add_argument(
         "--options", nargs="+", action=DictAction, help="custom options"
     )
     return parser

@@ -41,6 +41,7 @@ def launch(
     dist_url=None,
     cfg=(),
     timeout=DEFAULT_TIMEOUT,
+    backend="nccl",
 ):
     """
     Launch multi-gpu or distributed training.
@@ -56,6 +57,8 @@ def launch(
                        Can be set to "auto" to automatically select a free port on localhost
         timeout (timedelta): timeout of the distributed workers
         args (tuple): arguments passed to main_func
+        backend (str): distributed backend, e.g. "nccl" or "gloo". Use "gloo" on
+                       systems where NCCL is unavailable.
     """
     world_size = num_machines * num_gpus_per_machine
     if world_size > 1:
@@ -81,6 +84,7 @@ def launch(
                 dist_url,
                 cfg,
                 timeout,
+                backend,
             ),
             daemon=False,
         )
@@ -97,6 +101,7 @@ def _distributed_worker(
     dist_url,
     cfg,
     timeout=DEFAULT_TIMEOUT,
+    backend="nccl",
 ):
     assert (
         torch.cuda.is_available()
@@ -104,7 +109,7 @@ def _distributed_worker(
     global_rank = machine_rank * num_gpus_per_machine + local_rank
     try:
         dist.init_process_group(
-            backend="NCCL",
+            backend=backend,
             init_method=dist_url,
             world_size=world_size,
             rank=global_rank,

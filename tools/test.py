@@ -32,6 +32,7 @@ def main():
         machine_rank=args.machine_rank,
         dist_url=args.dist_url,
         cfg=(cfg,),
+        backend=args.dist_backend,
     )
 
 

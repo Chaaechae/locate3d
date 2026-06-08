@@ -14,9 +14,10 @@ RESUME=false
 NUM_GPU=None
 NUM_MACHINE=1
 DIST_URL="auto"
+DIST_BACKEND="nccl"
 
 
-while getopts "p:d:c:n:w:g:m:r:" opt; do
+while getopts "p:d:c:n:w:g:m:r:b:" opt; do
   case $opt in
     p)
       PYTHON=$OPTARG
@@ -41,6 +42,9 @@ while getopts "p:d:c:n:w:g:m:r:" opt; do
       ;;
     m)
       NUM_MACHINE=$OPTARG
+      ;;
+    b)
+      DIST_BACKEND=$OPTARG
       ;;
     \?)
       echo "Invalid option: -$OPTARG"
@@ -68,6 +72,7 @@ if [ -n "$SLURM_NODELIST" ]; then
 fi
 
 echo "Dist URL: $DIST_URL"
+echo "Dist Backend: $DIST_BACKEND"
 
 EXP_DIR=exp/${DATASET}/${EXP_NAME}
 MODEL_DIR=${EXP_DIR}/model
@@ -102,6 +107,7 @@ then
     --num-machines "$NUM_MACHINE" \
     --machine-rank ${SLURM_NODEID:-0} \
     --dist-url ${DIST_URL} \
+    --dist-backend ${DIST_BACKEND} \
     --options save_path="$EXP_DIR"
 else
     $PYTHON "$CODE_DIR"/tools/$TRAIN_CODE \
@@ -110,5 +116,6 @@ else
     --num-machines "$NUM_MACHINE" \
     --machine-rank ${SLURM_NODEID:-0} \
     --dist-url ${DIST_URL} \
+    --dist-backend ${DIST_BACKEND} \
     --options save_path="$EXP_DIR" resume="$RESUME" weight="$WEIGHT"
 fi
