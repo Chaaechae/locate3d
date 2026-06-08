@@ -351,6 +351,31 @@ class DefaultImagePointDataset(Dataset):
             data_dict[asset[:-4]] = np.load(os.path.join(pointclouds_path, asset))
         if self.if_img:
             imgs_path = data_path["images"]
+            correspondences_path = data_path["correspondences"]
+            # Skip views whose image or correspondence file is missing on disk,
+            # keeping image[i] <-> correspondence[i] aligned (the model indexes views
+            # by position, so both lists must stay the same length and order).
+            if len(imgs_path) == len(correspondences_path):
+                kept = [
+                    (ip, cp)
+                    for ip, cp in zip(imgs_path, correspondences_path)
+                    if os.path.exists(ip) and os.path.exists(cp)
+                ]
+                if len(kept) != len(imgs_path):
+                    get_root_logger().warning(
+                        "[{}] skipping {} of {} views with missing "
+                        "image/correspondence files.".format(
+                            name, len(imgs_path) - len(kept), len(imgs_path)
+                        )
+                    )
+                imgs_path = [ip for ip, _ in kept]
+                correspondences_path = [cp for _, cp in kept]
+            else:
+                # Unexpected for these datasets; filter each independently as a fallback.
+                imgs_path = [p for p in imgs_path if os.path.exists(p)]
+                correspondences_path = [
+                    p for p in correspondences_path if os.path.exists(p)
+                ]
             imgs = [Image.open(asset) for asset in imgs_path]
             if len(imgs) > 0:
                 img_width, img_height = imgs[0].size
@@ -380,7 +405,7 @@ class DefaultImagePointDataset(Dataset):
                 [data_dict["images"].shape[0]], dtype=np.int32
             )
 
-            correspondences_path = data_path["correspondences"]
+            # correspondences_path was filtered above to match imgs_path.
             correspondence_infos = np.ones(
                 (data_dict["coord"].shape[0], len(correspondences_path), 2),
                 dtype=np.float32,
@@ -425,11 +450,29 @@ class DefaultImagePointDataset(Dataset):
             )
         return data_dict
 
+    # Number of alternative samples to try when a sample cannot be loaded from disk
+    # (e.g. missing pointcloud dir / files referenced by the split json).
+    max_load_retry = 10
+
     def prepare_train_data(self, idx):
-        # load data
-        data_dict = self.get_data(idx)
-        data_dict = self.transform(data_dict)
-        return data_dict
+        for attempt in range(self.max_load_retry):
+            try:
+                data_dict = self.get_data(idx)
+                data_dict = self.transform(data_dict)
+                return data_dict
+            except (FileNotFoundError, OSError) as e:
+                get_root_logger().warning(
+                    "Failed to load sample '{}' (attempt {}/{}): {}. "
+                    "Skipping to another sample.".format(
+                        self.get_data_name(idx), attempt + 1, self.max_load_retry, e
+                    )
+                )
+                idx = np.random.randint(0, len(self.data_name))
+        raise RuntimeError(
+            "Could not load a valid training sample after {} retries.".format(
+                self.max_load_retry
+            )
+        )
 
     def prepare_test_data(self, idx):
         # load data
