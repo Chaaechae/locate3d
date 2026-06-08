@@ -36,6 +36,14 @@ Usage:
 
 Run --verify first: if the scanned-val output does not match val.json byte-for-byte,
 the conventions differ and test.json would be wrong — fix before trusting the output.
+
+Paths & base_path: split-json paths are consumed verbatim (not joined with data_root),
+so if val.json stores RELATIVE paths like "data/structure3d/..." they resolve against the
+training cwd (the base_path, e.g. /group-volume/3Ddataset/). This tool keeps whatever
+prefix val.json uses, so test.json resolves identically. ``--root`` is the *physical*
+location used only for scanning the disk (absolute path, independent of cwd); it must be
+the on-disk dir whose contents match val.json (``--verify`` proves this). If splits/ and
+the image data live under different dirs, set ``--val-json`` and/or ``--out`` explicitly.
 """
 
 import argparse
@@ -168,6 +176,8 @@ def build_split(root, split_name, conv):
     images_dir = os.path.join(root, "images", split_name)
     if not os.path.isdir(images_dir):
         raise SystemExit(f"Directory not found: {images_dir}")
+    print(f"Scanning disk: {images_dir}  (json paths will use prefix "
+          f"'{conv['json_prefix']}', kept relative exactly as in val.json)")
 
     def render(tpl, prefix, scene, room):
         return tpl.format(prefix=prefix, split=split_name, scene=scene, room=room)
