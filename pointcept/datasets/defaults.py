@@ -421,8 +421,27 @@ class DefaultImagePointDataset(Dataset):
                     (left, top, right, bottom),
                     self.patch_size,
                 )
+                # The last column is the point index into coord. Drop entries whose
+                # index is out of range (mismatched / off-by-one correspondence files)
+                # so they are simply treated as "no correspondence" instead of crashing.
+                point_idx = correspondence_info[:, -1].astype(np.int64)
+                num_points = data_dict["coord"].shape[0]
+                in_range = (point_idx >= 0) & (point_idx < num_points)
+                if not in_range.all():
+                    get_root_logger().warning(
+                        "[{}] view {}: dropping {} of {} correspondences with "
+                        "point index out of range [0, {}).".format(
+                            name,
+                            asset_id,
+                            int((~in_range).sum()),
+                            in_range.shape[0],
+                            num_points,
+                        )
+                    )
+                    correspondence_info = correspondence_info[in_range]
+                    point_idx = point_idx[in_range]
                 correspondence_infos[
-                    correspondence_info[:, -1].astype(np.int32), asset_id, :
+                    point_idx, asset_id, :
                 ] = correspondence_info[:, :-1]
             data_dict["correspondence"] = correspondence_infos  # .reshape(-1, 2)
 
