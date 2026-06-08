@@ -16,10 +16,14 @@ Why template-driven (instead of hardcoding paths):
 
 Schema of each entry (see pointcept/datasets/defaults.py:get_data):
     "<name>": {
-        "pointclouds":     "<room dir>",              # dir holding coord/color/normal .npy
-        "images":          ["<.../prsp/0.png>", ...], # ordered; images[i] <-> correspondences[i]
-        "correspondences": ["<.../0.npy>", ...],      # ordered to match images
+        "pointclouds":     "<root>/<split>/<scene>/<room>",  # dir with coord/color/normal .npy
+        "images":          ["<root>/images/<split>/<scene>/<room>/prsp/0.png", ...],
+        "correspondences": ["<root>/images/<split>/<scene>/<room>/correspondence/"
+                            "prsp_correspondence/0.npy", ...],
     }
+Note: pointclouds live under "<root>/<split>/..." while images/correspondences live under
+"<root>/images/<split>/...". The two subtrees differ, so each path role is learned as an
+independent template over (prefix, split, scene, room) rather than relative to one room dir.
 
 Usage:
     # 1) First PROVE the conventions are right by reproducing val.json from disk:
@@ -49,8 +53,34 @@ def numeric_key(path):
     return (int(nums[0]) if nums else -1, stem)
 
 
+def _templatize_dir(path, prefix, split, scene, room):
+    """Turn a concrete directory path into a template over {prefix}/{split}/{scene}/{room}.
+
+    Operates on whole path segments so short tokens (e.g. split='val') can't match
+    accidentally inside a longer segment.
+    """
+    if not path.startswith(prefix):
+        raise SystemExit(
+            f"path '{path}' does not start with the prefix '{prefix}' learned from the "
+            f"images path; the dataset layout is unexpected."
+        )
+    rest = path[len(prefix):]  # leading "/..."
+    segs = rest.split("/")
+    out = []
+    for s in segs:
+        if s == split:
+            out.append("{split}")
+        elif s == scene:
+            out.append("{scene}")
+        elif s == room:
+            out.append("{room}")
+        else:
+            out.append(s)
+    return "{prefix}" + "/".join(out)
+
+
 def learn_convention(val_json_path):
-    """Infer path prefix, per-room sub-structure and key format from val.json."""
+    """Infer per-role path templates and key format from val.json (anchored on images)."""
     with open(val_json_path, "r", encoding="utf-8") as f:
         val = json.load(f)
     if not val:
@@ -66,6 +96,8 @@ def learn_convention(val_json_path):
                 f"val.json entry '{first_name}' is missing key '{k}'. "
                 f"Found keys: {list(entry.keys())}"
             )
+    if not entry["images"] or not entry["correspondences"]:
+        raise SystemExit(f"val.json entry '{first_name}' has empty images/correspondences.")
     extra = [k for k in entry.keys() if k not in required]
     if extra:
         print(
@@ -74,26 +106,33 @@ def learn_convention(val_json_path):
             file=sys.stderr,
         )
 
-    room_json = entry["pointclouds"].rstrip("/")
-    marker = "/images/"
-    if marker not in room_json:
-        raise SystemExit(
-            f"Unexpected pointclouds path (no '{marker}'): {room_json}"
-        )
-    idx = room_json.index(marker)
-    json_prefix = room_json[:idx]  # e.g. "data/structure3d" or absolute root
-    tail = room_json[idx + len(marker):]  # "<split>/<scene>/<room>"
-    parts = tail.split("/")
-    if len(parts) < 3:
-        raise SystemExit(f"Cannot parse <split>/<scene>/<room> from: {room_json}")
-    val_split, scene, room = parts[0], parts[1], parts[2]
-
+    # Anchor on the images path, which reliably contains the '/images/' marker.
     img0 = entry["images"][0]
-    corr0 = entry["correspondences"][0]
-    img_subdir = os.path.relpath(os.path.dirname(img0), room_json)
-    corr_subdir = os.path.relpath(os.path.dirname(corr0), room_json)
+    marker = "/images/"
+    if marker not in img0:
+        raise SystemExit(f"Unexpected images path (no '{marker}'): {img0}")
+    json_prefix, tail = img0.split(marker, 1)  # tail = "<split>/<scene>/<room>/<sub>/<file>"
+    segs = tail.split("/")
+    if len(segs) < 5:
+        raise SystemExit(f"Cannot parse <split>/<scene>/<room>/<subdir>/<file> from: {img0}")
+    val_split, scene, room = segs[0], segs[1], segs[2]
+    img_subdir = "/".join(segs[3:-1])
     img_ext = os.path.splitext(img0)[1]
+
+    corr0 = entry["correspondences"][0]
+    if marker not in corr0:
+        raise SystemExit(f"Unexpected correspondences path (no '{marker}'): {corr0}")
+    corr_segs = corr0.split(marker, 1)[1].split("/")
+    corr_subdir = "/".join(corr_segs[3:-1])
     corr_ext = os.path.splitext(corr0)[1]
+
+    # Independent templates over {prefix}/{split}/{scene}/{room}.
+    img_dir_tpl = "{prefix}/images/{split}/{scene}/{room}/" + img_subdir
+    corr_dir_tpl = "{prefix}/images/{split}/{scene}/{room}/" + corr_subdir
+    # pointclouds lives in a separate subtree; learn it from the actual stored value.
+    pc_tpl = _templatize_dir(
+        entry["pointclouds"].rstrip("/"), json_prefix, val_split, scene, room
+    )
 
     # Key format: turn the concrete name into a template by substituting scene/room.
     key_template = first_name.replace(scene, "{scene}").replace(room, "{room}")
@@ -106,8 +145,9 @@ def learn_convention(val_json_path):
     conv = dict(
         json_prefix=json_prefix,
         val_split=val_split,
-        img_subdir=img_subdir,
-        corr_subdir=corr_subdir,
+        img_dir_tpl=img_dir_tpl,
+        corr_dir_tpl=corr_dir_tpl,
+        pc_tpl=pc_tpl,
         img_ext=img_ext,
         corr_ext=corr_ext,
         key_template=key_template,
@@ -120,28 +160,40 @@ def learn_convention(val_json_path):
 
 
 def build_split(root, split_name, conv):
-    """Scan <root>/images/<split_name> on disk and build the split dict."""
+    """Scan the images subtree of <split_name> on disk and build the split dict.
+
+    `root` is the on-disk dataset root used for scanning; the emitted json strings use
+    the (possibly different) prefix learned from val.json (conv['json_prefix']).
+    """
     images_dir = os.path.join(root, "images", split_name)
     if not os.path.isdir(images_dir):
         raise SystemExit(f"Directory not found: {images_dir}")
 
+    def render(tpl, prefix, scene, room):
+        return tpl.format(prefix=prefix, split=split_name, scene=scene, room=room)
+
     out = {}
-    n_rooms = n_skipped = 0
+    n_rooms = n_skipped = n_nopc = 0
     for scene in sorted(os.listdir(images_dir)):
         scene_disk = os.path.join(images_dir, scene)
         if not os.path.isdir(scene_disk):
             continue
         for room in sorted(os.listdir(scene_disk)):
-            room_disk = os.path.join(scene_disk, room)
-            if not os.path.isdir(room_disk):
+            if not os.path.isdir(os.path.join(scene_disk, room)):
                 continue
 
-            img_glob = os.path.join(room_disk, conv["img_subdir"], "*" + conv["img_ext"])
-            corr_glob = os.path.join(
-                room_disk, conv["corr_subdir"], "*" + conv["corr_ext"]
+            img_dir_disk = render(conv["img_dir_tpl"], root, scene, room)
+            corr_dir_disk = render(conv["corr_dir_tpl"], root, scene, room)
+            pc_dir_disk = render(conv["pc_tpl"], root, scene, room)
+
+            imgs = sorted(
+                glob.glob(os.path.join(img_dir_disk, "*" + conv["img_ext"])),
+                key=numeric_key,
             )
-            imgs = sorted(glob.glob(img_glob), key=numeric_key)
-            corrs = sorted(glob.glob(corr_glob), key=numeric_key)
+            corrs = sorted(
+                glob.glob(os.path.join(corr_dir_disk, "*" + conv["corr_ext"])),
+                key=numeric_key,
+            )
 
             if not imgs:
                 n_skipped += 1
@@ -153,37 +205,34 @@ def build_split(root, split_name, conv):
                     f"may be off.",
                     file=sys.stderr,
                 )
+            if not os.path.isdir(pc_dir_disk):
+                n_nopc += 1
+                print(
+                    f"WARNING: pointclouds dir not found on disk for {scene}/{room}: "
+                    f"{pc_dir_disk}",
+                    file=sys.stderr,
+                )
 
-            room_json = "{prefix}/images/{split}/{scene}/{room}".format(
-                prefix=conv["json_prefix"], split=split_name, scene=scene, room=room
-            )
-            images_json = [
-                "{room}/{sub}/{name}".format(
-                    room=room_json, sub=conv["img_subdir"], name=os.path.basename(p)
-                )
-                for p in imgs
-            ]
-            corr_json = [
-                "{room}/{sub}/{name}".format(
-                    room=room_json, sub=conv["corr_subdir"], name=os.path.basename(p)
-                )
-                for p in corrs
-            ]
+            img_dir_json = render(conv["img_dir_tpl"], conv["json_prefix"], scene, room)
+            corr_dir_json = render(conv["corr_dir_tpl"], conv["json_prefix"], scene, room)
+            pc_dir_json = render(conv["pc_tpl"], conv["json_prefix"], scene, room)
+
             entry = {
-                "pointclouds": room_json,
-                "images": images_json,
-                "correspondences": corr_json,
+                "pointclouds": pc_dir_json,
+                "images": [f"{img_dir_json}/{os.path.basename(p)}" for p in imgs],
+                "correspondences": [
+                    f"{corr_dir_json}/{os.path.basename(p)}" for p in corrs
+                ],
             }
             # Preserve key order exactly as val.json had it.
             ordered = {k: entry[k] for k in conv["key_order"]}
-            key = conv["key_template"].format(scene=scene, room=room)
-            out[key] = ordered
+            out[conv["key_template"].format(scene=scene, room=room)] = ordered
             n_rooms += 1
 
-    print(
-        f"Scanned split '{split_name}': {n_rooms} rooms, "
-        f"{n_skipped} skipped (no images)."
-    )
+    msg = f"Scanned split '{split_name}': {n_rooms} rooms, {n_skipped} skipped (no images)"
+    if n_nopc:
+        msg += f", {n_nopc} missing pointclouds dir"
+    print(msg + ".")
     return out
 
 
