@@ -34,7 +34,6 @@ Usage (exercise the real distributed / gloo + multi-H100 setup):
 
 import os
 import sys
-import tempfile
 
 import torch
 
@@ -321,9 +320,10 @@ def main():
     args = parser.parse_args()
 
     cfg = default_config_parser(args.config_file, args.options)
-    # Redirect outputs to a throwaway dir unless the user pinned save_path via --options.
+    # Keep all debug outputs inside the repo (do not depend on /tmp).
     if cfg.save_path in (None, "", "exp/default"):
-        cfg.save_path = tempfile.mkdtemp(prefix="utonia_debug_")
+        stem = os.path.splitext(os.path.basename(args.config_file))[0]
+        cfg.save_path = os.path.join("exp", "debug_pretrain", stem)
         os.makedirs(os.path.join(cfg.save_path, "model"), exist_ok=True)
     cfg.resume = False
 
