@@ -44,6 +44,7 @@ from pointcept.engines.defaults import (
 )
 from pointcept.engines.launch import launch
 from pointcept.engines.train import TRAINERS
+from pointcept.utils.events import EventStorage
 import pointcept.utils.comm as comm
 
 
@@ -191,6 +192,13 @@ def debug_worker(cfg, max_iters, epochs):
     trainer = TRAINERS.build(dict(type=cfg.train.type, cfg=cfg))
     net = _unwrap(trainer.model)
 
+    # The real Trainer.train() runs everything inside an EventStorage context; both
+    # before_train() and the per-step hooks read trainer.storage, so we must open one
+    # here (otherwise: AttributeError: Trainer has no attribute 'storage').
+    storage = EventStorage()
+    storage.__enter__()
+    trainer.storage = storage
+
     # Hook lifecycle: sets up teacher-temp / momentum / mask schedulers and EMA, exactly
     # like a real run, so the captured trend is meaningful.
     trainer.before_train()
@@ -254,6 +262,9 @@ def debug_worker(cfg, max_iters, epochs):
 
     results["losses_finite"] = all_finite
     results["grad_health"] = grad_ok
+
+    # Close the EventStorage context opened above (the trend/summary below do not use it).
+    storage.__exit__(None, None, None)
 
     # ---- direction / trend -----------------------------------------------------------
     _log("\n[6] Direction (first-half vs last-half mean)")
