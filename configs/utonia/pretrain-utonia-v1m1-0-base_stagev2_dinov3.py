@@ -16,6 +16,7 @@ clip_grad = 1.0
 empty_cache = True
 enable_amp = True
 amp_dtype = "bfloat16"
+enable_wandb = False
 evaluate = False
 find_unused_parameters = True
 
