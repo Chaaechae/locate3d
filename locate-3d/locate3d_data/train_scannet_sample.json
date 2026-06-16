@@ -1,0 +1,41 @@
+[
+  {
+    "object_id": 4,
+    "object_name": "telephone",
+    "ann_id": 0,
+    "description": "Wall mounted telephone is near to the toilet",
+    "token": [
+      "Wall",
+      "mounted",
+      "telephone",
+      "is",
+      "near",
+      "to",
+      "the",
+      "toilet"
+    ],
+    "entities": [
+      [
+        [
+          7
+        ],
+        [
+          "7_toilet"
+        ]
+      ],
+      [
+        [
+          0,
+          1,
+          2
+        ],
+        [
+          "4_telephone"
+        ]
+      ]
+    ],
+    "primary_key": "1245439773444459",
+    "scene_id": "scene0625_00",
+    "scene_dataset": "ScanNet"
+  }
+]

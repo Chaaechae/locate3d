@@ -28,3 +28,6 @@ from .point_prompt_training import *
 from .sonata import *
 from .concerto import *
 from .utonia import *
+
+# Localization / referring grounding (Locate-3D decoder)
+from .locate_3d import *
